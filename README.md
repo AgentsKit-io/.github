@@ -1,5 +1,3 @@
-# .github
-Shared reusable workflows and dependency-update presets for AgentsKit-io repositories
 # AgentsKit shared GitHub configuration
 
 This public repository provides reusable security checks and an organization
