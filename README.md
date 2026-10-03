@@ -9,8 +9,8 @@ release workflow, and package-specific checks.
 ## Reusable security workflows
 
 Each caller should pin a reusable workflow to a full commit SHA. The examples
-below use the initial security-workflow revision
-`518006fb10c42cefb345af3d451f6677742a09c9`; update that reference only after
+below use reviewed workflow revision
+`a92994b7ee9271d6124414bd7e3709265d7ecea5`; update that reference only after
 reviewing a newer revision.
 
 | Workflow | What it checks | Inputs |
@@ -45,7 +45,7 @@ permissions:
   contents: read
 jobs:
   analyze:
-    uses: AgentsKit-io/.github/.github/workflows/codeql.yml@518006fb10c42cefb345af3d451f6677742a09c9
+    uses: AgentsKit-io/.github/.github/workflows/codeql.yml@a92994b7ee9271d6124414bd7e3709265d7ecea5
     with:
       languages: javascript-typescript
       queries: security-extended
@@ -70,7 +70,7 @@ permissions:
   contents: read
 jobs:
   scorecard:
-    uses: AgentsKit-io/.github/.github/workflows/scorecard.yml@518006fb10c42cefb345af3d451f6677742a09c9
+    uses: AgentsKit-io/.github/.github/workflows/scorecard.yml@a92994b7ee9271d6124414bd7e3709265d7ecea5
     permissions:
       contents: read
       id-token: write
@@ -87,7 +87,7 @@ permissions:
   contents: read
 jobs:
   review:
-    uses: AgentsKit-io/.github/.github/workflows/dependency-review.yml@518006fb10c42cefb345af3d451f6677742a09c9
+    uses: AgentsKit-io/.github/.github/workflows/dependency-review.yml@a92994b7ee9271d6124414bd7e3709265d7ecea5
     with:
       fail-on-severity: high
       deny-licenses: GPL-2.0,GPL-3.0,AGPL-1.0,AGPL-3.0
@@ -108,7 +108,7 @@ permissions:
   contents: read
 jobs:
   audit:
-    uses: AgentsKit-io/.github/.github/workflows/audit.yml@518006fb10c42cefb345af3d451f6677742a09c9
+    uses: AgentsKit-io/.github/.github/workflows/audit.yml@a92994b7ee9271d6124414bd7e3709265d7ecea5
     with:
       package-manager: npm
       working-directories: '[".","apps/docs"]'
