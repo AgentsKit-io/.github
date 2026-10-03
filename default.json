@@ -1,0 +1,53 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:recommended"],
+  "schedule": ["on monday"],
+  "timezone": "America/Sao_Paulo",
+  "dependencyDashboard": true,
+  "separateMajorMinor": true,
+  "pinDigests": true,
+  "packageRules": [
+    {
+      "description": "Group npm development dependency patch and minor updates; automerge after platform checks pass",
+      "matchManagers": ["npm"],
+      "matchDepTypes": ["devDependencies"],
+      "matchUpdateTypes": ["patch", "minor"],
+      "groupName": "Development dependencies (patch and minor)",
+      "automerge": true,
+      "platformAutomerge": true
+    },
+    {
+      "description": "Group production runtime patch and minor updates for human review",
+      "matchManagers": ["npm"],
+      "matchDepTypes": ["dependencies"],
+      "matchUpdateTypes": ["patch", "minor"],
+      "groupName": "Production dependencies (patch and minor)",
+      "automerge": false,
+      "minimumReleaseAge": "3 days"
+    },
+    {
+      "description": "Wait a few days after npm releases before proposing development dependency updates",
+      "matchManagers": ["npm"],
+      "minimumReleaseAge": "3 days"
+    },
+    {
+      "description": "Widen runtime dependency ranges rather than pinning published library dependencies",
+      "matchManagers": ["npm"],
+      "matchDepTypes": ["dependencies"],
+      "rangeStrategy": "widen"
+    },
+    {
+      "description": "Group safe GitHub Actions updates and let GitHub merge after required checks pass",
+      "matchManagers": ["github-actions"],
+      "matchUpdateTypes": ["digest", "patch", "minor"],
+      "groupName": "GitHub Actions",
+      "automerge": true,
+      "platformAutomerge": true
+    },
+    {
+      "description": "Keep major updates separate and require human review",
+      "matchUpdateTypes": ["major"],
+      "automerge": false
+    }
+  ]
+}
