@@ -129,4 +129,10 @@ verify the release SHA against the upstream repository, update the comment,
 and run the self-test. Callers pin this repository's reusable workflows to a
 reviewed full commit SHA; Renovate can propose those pin updates for review.
 The self-test runs on pushes and pull requests, invokes each reusable workflow
-on this repository where applicable, and runs actionlint v1.7.12.
+on this repository where applicable, and runs actionlint v1.7.12. The central
+repository has no package manifests, so the audit call uses an empty directory
+list and is intentionally skipped. Dependency review needs GitHub's dependency
+graph, which is disabled here; that reusable workflow is validated by
+actionlint and should be exercised by a caller repository with the graph
+enabled. Scorecard runs on PRs and on pushes to the default branch because the
+upstream action only accepts the default branch for push events.

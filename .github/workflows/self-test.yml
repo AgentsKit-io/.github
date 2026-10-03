@@ -33,20 +33,12 @@ jobs:
       build-mode: none
 
   scorecard:
+    if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main'
     uses: ./.github/workflows/scorecard.yml
     permissions:
       contents: read
       id-token: write
       security-events: write
-
-  dependency-review:
-    if: github.event_name == 'pull_request'
-    uses: ./.github/workflows/dependency-review.yml
-    permissions:
-      contents: read
-      pull-requests: read
-    with:
-      fail-on-severity: critical
 
   audit:
     uses: ./.github/workflows/audit.yml
