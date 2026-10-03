@@ -18,14 +18,17 @@ reviewing a newer revision.
 | `codeql.yml` | CodeQL static analysis and SARIF upload. Uses the selected language set, query suite, and build mode. | `languages` (required, comma-separated); `queries` (default `security-extended`); `build-mode` (default `autobuild`) |
 | `scorecard.yml` | OpenSSF Scorecard and publishes its SARIF results. | None |
 | `dependency-review.yml` | New or changed dependencies on pull requests. Does not write PR comments. | `fail-on-severity` (`critical` by default; use `high` to match stricter current callers); `deny-licenses`; `allow-licenses` (comma-separated SPDX values, both default empty) |
-| `audit.yml` | npm or pnpm advisory audit in each supplied directory. Production-only mode omits development dependencies. | `package-manager` (`npm` or `pnpm`, required); `working-directories` (required JSON array); `audit-level` (default `high`); `production-only` (default `false`) |
+| `audit.yml` | npm or pnpm advisory audit in each supplied directory. Production-only mode omits development dependencies. | `package-manager` (`npm` or `pnpm`, required); `working-directories` (required JSON array); `audit-level` (default `high`); `production-only` (default `false`); `use-pnpm-bulk-api` (default `false`, for pnpm's Bulk Advisory API path) |
 
 The five-repository inventory informed these interfaces: CodeQL covers the
 four repositories that currently run it; Scorecard and dependency review cover
 those same four; package audit supports the npm root plus `apps/docs` shape and
-the pnpm production audits used by the workspaces. Existing callers can retain
-their severity and license policies through inputs. The central workflows do
-not replace repository-specific CI, release, publishing, or build steps.
+the pnpm production audits used by the workspaces. Set `use-pnpm-bulk-api: true`
+for AgentsKit to preserve its lockfile-resolved production graph check against
+npm's supported Bulk Advisory API; other pnpm callers can keep using native
+`pnpm audit`. Existing callers can retain their severity and license policies
+through inputs. The central workflows do not replace repository-specific CI,
+release, publishing, or build steps.
 
 ### Caller examples
 
@@ -118,6 +121,8 @@ jobs:
 For a pnpm workspace, use `package-manager: pnpm`, pass its lockfile root (or
 each audited workspace directory) in `working-directories`, and set
 `audit-level: critical` to preserve the current Chat and Playbook threshold.
+For the AgentsKit audit, also set `use-pnpm-bulk-api: true`,
+`audit-level: high`, and `production-only: true`.
 Do not use `secrets: inherit`; these security workflows need no caller secrets.
 
 ### Pin updates

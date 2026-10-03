@@ -21,6 +21,11 @@ on:
         required: false
         type: boolean
         default: false
+      use-pnpm-bulk-api:
+        description: Use npm's supported bulk advisory API for a pnpm dependency graph
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -46,6 +51,16 @@ jobs:
       - name: Set up pnpm
         if: inputs.package-manager == 'pnpm'
         uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
+      - name: Install pnpm dependencies for bulk advisory inventory
+        if: inputs.package-manager == 'pnpm' && inputs.use-pnpm-bulk-api
+        run: pnpm install --frozen-lockfile --ignore-scripts
+      - name: Run pnpm bulk advisory audit
+        if: inputs.package-manager == 'pnpm' && inputs.use-pnpm-bulk-api
+        shell: bash
+        env:
+          AUDIT_LEVEL: ${{ inputs.audit-level }}
+          PRODUCTION_ONLY: ${{ inputs.production-only }}
+        run: node "$GITHUB_WORKSPACE/.github/scripts/pnpm-bulk-audit.mjs"
       - name: Run npm audit
         if: inputs.package-manager == 'npm'
         shell: bash
@@ -59,7 +74,7 @@ jobs:
             npm audit --audit-level="$AUDIT_LEVEL"
           fi
       - name: Run pnpm audit
-        if: inputs.package-manager == 'pnpm'
+        if: inputs.package-manager == 'pnpm' && !inputs.use-pnpm-bulk-api
         shell: bash
         env:
           AUDIT_LEVEL: ${{ inputs.audit-level }}
