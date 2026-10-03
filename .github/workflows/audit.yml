@@ -50,7 +50,7 @@ jobs:
           node-version: 24
       - name: Set up pnpm
         if: inputs.package-manager == 'pnpm'
-        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
       - name: Install pnpm dependencies for bulk advisory inventory
         if: inputs.package-manager == 'pnpm' && inputs.use-pnpm-bulk-api
         run: pnpm install --frozen-lockfile --ignore-scripts
