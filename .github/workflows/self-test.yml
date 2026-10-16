@@ -49,3 +49,20 @@ jobs:
       working-directories: '[]'
       audit-level: high
       production-only: true
+
+  pick-runner:
+    uses: ./.github/workflows/pick-runner.yml
+    permissions: {}
+    with:
+      force_runner: ${{ vars.FORCE_RUNNER }}
+    secrets:
+      ORG_BILLING_TOKEN: ${{ secrets.ORG_BILLING_TOKEN }}
+
+  print-runner:
+    needs: [pick-runner]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Print selected runner
+        env:
+          RUNNER: ${{ needs.pick-runner.outputs.runner }}
+        run: printf '%s\n' "$RUNNER"
