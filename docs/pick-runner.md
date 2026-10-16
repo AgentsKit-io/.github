@@ -40,6 +40,17 @@ was checked on 2026-10-16: it lists `ubuntu-24.04-arm` among standard private
 repository runners using the account's included minutes, without a paid-plan
 restriction. This is the standard runner, not a larger runner.
 
+- Organization Actions policy must allow repositories to use actions and reusable
+  workflows from `AgentsKit-io` (Settings → Actions → General).
+
+Notes:
+
+- Dependabot-triggered runs do not receive Actions secrets, so the picker has no
+  token there: it warns and uses Depot. Add `ORG_BILLING_TOKEN` as a Dependabot
+  secret too if those runs should use GitHub minutes.
+- The picker job itself always runs on Depot (a few seconds per workflow run),
+  because the GitHub quota may already be exhausted when it runs.
+
 When both GitHub included minutes and Depot's 2,000 minutes/month are exhausted,
 jobs will not start unless additional capacity is available.
 
