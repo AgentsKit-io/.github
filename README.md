@@ -144,7 +144,7 @@ upstream action only accepts the default branch for push events.
 
 Private repositories can use [pick-runner](docs/pick-runner.md) to select
 GitHub-hosted runners while included minutes remain and Depot afterward.
-Public repositories keep their existing free GitHub-hosted runners.
+Public repositories always get free GitHub-hosted runners, picker included.
 
 ## Renovate organization preset
 

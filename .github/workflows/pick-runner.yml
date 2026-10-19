@@ -31,7 +31,8 @@ permissions: {}
 
 jobs:
   pick:
-    runs-on: depot-ubuntu-24.04
+    # Public repositories run on GitHub-hosted runners (free there); Depot is for private ones.
+    runs-on: ${{ github.event.repository.private == false && 'ubuntu-latest' || 'depot-ubuntu-24.04' }}
     timeout-minutes: 3
     permissions: {}
     outputs:
@@ -46,6 +47,7 @@ jobs:
           MIN_REMAINING: ${{ inputs.min_remaining }}
           VARIANT: ${{ inputs.variant }}
           FORCE_RUNNER: ${{ inputs.force_runner }}
+          REPO_PRIVATE: ${{ github.event.repository.private }}
           INCLUDED_MINUTES: ${{ inputs.included_minutes }}
         run: |
           set -euo pipefail
@@ -64,6 +66,11 @@ jobs:
           if [[ -n "$FORCE_RUNNER" ]]; then
             runner=$FORCE_RUNNER
             reason='forced by caller'
+          elif [[ "$REPO_PRIVATE" == false ]]; then
+            runner=ubuntu-latest
+            [[ "$VARIANT" != arm ]] || runner=ubuntu-24.04-arm
+            [[ "$VARIANT" != 4 && "$VARIANT" != 8 ]] || warn 'Larger runners are not used on public repositories; using ubuntu-latest'
+            reason='public repository: GitHub-hosted runners are free'
           elif [[ "$VARIANT" == 4 || "$VARIANT" == 8 ]]; then
             runner="depot-ubuntu-24.04-$VARIANT"
             reason='larger runners require Depot'

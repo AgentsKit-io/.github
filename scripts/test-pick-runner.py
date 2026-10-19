@@ -24,7 +24,7 @@ if [[ "$*" == *'/repos?'* ]]; then cat "$FIXTURE/repos.json"; else cat "$FIXTURE
     fake.chmod(0o700)
     env = dict(os.environ, PATH=f'{root}:{os.environ["PATH"]}', FIXTURE=str(root),
                GH_TOKEN='fixture-placeholder', ORG='AgentsKit-io', MIN_REMAINING='100',
-               INCLUDED_MINUTES='2000', VARIANT='', FORCE_RUNNER='', FAIL_API='0',
+               INCLUDED_MINUTES='2000', VARIANT='', FORCE_RUNNER='', FAIL_API='0', REPO_PRIVATE='true',
                GITHUB_STEP_SUMMARY=str(root / 'summary'), GITHUB_OUTPUT=str(root / 'output'))
     repos = [[dict(name='private', private=True)]]
     usage = [dict(usageItems=[item('Actions Linux', 100), item('Actions Windows', 100),
@@ -62,6 +62,13 @@ if [[ "$*" == *'/repos?'* ]]; then cat "$FIXTURE/repos.json"; else cat "$FIXTURE
     run('force precedes larger variant/API', 'custom-runner', FORCE_RUNNER='custom-runner', VARIANT='8', FAIL_API='1')
     for variant in ('4', '8'):
         run(f'larger {variant}', f'depot-ubuntu-24.04-{variant}', VARIANT=variant, FAIL_API='1')
+    # Public repositories never use Depot, whatever the billing data says; force still wins.
+    run('public repository', 'ubuntu-latest', REPO_PRIVATE='false', FAIL_API='1')
+    run('public arm', 'ubuntu-24.04-arm', REPO_PRIVATE='false', VARIANT='arm')
+    for variant in ('4', '8'):
+        run(f'public larger {variant}', 'ubuntu-latest', REPO_PRIVATE='false', VARIANT=variant)
+    run('public forced', 'custom-runner', REPO_PRIVATE='false', FORCE_RUNNER='custom-runner')
+    run('unknown visibility uses the private rules', 'depot-ubuntu-24.04', REPO_PRIVATE='', FAIL_API='1')
     (root / 'usage.json').write_text('invalid json')
     run('malformed response', 'depot-ubuntu-24.04')
     if '--live' in sys.argv:

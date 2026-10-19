@@ -1,24 +1,29 @@
 # Pick a CI runner
 
 Private repositories can call `pick-runner.yml` to spend included GitHub Actions
-minutes first, then use Depot. Public repositories should keep their existing
-GitHub-hosted runners: Actions is free there. This repository's existing jobs
-remain on `ubuntu-latest`.
+minutes first, then use Depot. Public repositories never use Depot: Actions is
+free there, so the picker returns GitHub-hosted runners for them (and runs on
+one itself). The organization runs no Windows jobs in CI.
 
 Decision order:
 
 1. A nonempty `force_runner` wins, without billing calls.
-2. Variants `4` and `8` always use `depot-ubuntu-24.04-4` / `-8`:
+2. A public repository (`github.event.repository.private == false`) gets
+   `ubuntu-latest` (`ubuntu-24.04-arm` for `arm`; variants `4`/`8` warn and
+   also get `ubuntu-latest`), without billing calls. Unknown visibility follows
+   the private rules.
+3. Variants `4` and `8` always use `depot-ubuntu-24.04-4` / `-8`:
    GitHub larger runners do not use included minutes.
-3. Read the current UTC month's organization billing usage and all private repos.
+4. Read the current UTC month's organization billing usage and all private repos.
    Count only private-repository Actions minutes: Linux ×1, Windows ×2, macOS ×10.
    Ignore storage and public repositories. Unknown minute SKUs count ×1 and warn.
-4. If `included_minutes - used > min_remaining`, use `ubuntu-latest` (or
+5. If `included_minutes - used > min_remaining`, use `ubuntu-latest` (or
    `ubuntu-24.04-arm` for `arm`); otherwise use `depot-ubuntu-24.04` (or `-arm`).
    Missing token, API failures, or malformed responses warn and use Depot.
 
 Defaults: `min_remaining: 100`, `included_minutes: 2000`, `variant: ''`,
-`force_runner: ''`. The picker itself runs on Depot with a three-minute timeout
+`force_runner: ''`. The picker itself runs on Depot in private repositories and
+on `ubuntu-latest` in public ones, with a three-minute timeout
 and no `GITHUB_TOKEN` permissions. It logs used/remaining minutes, label, and
 reason to the job log and step summary. It does not check out the caller.
 
@@ -48,11 +53,13 @@ Notes:
 - Dependabot-triggered runs do not receive Actions secrets, so the picker has no
   token there: it warns and uses Depot. Add `ORG_BILLING_TOKEN` as a Dependabot
   secret too if those runs should use GitHub minutes.
-- The picker job itself always runs on Depot (a few seconds per workflow run),
-  because the GitHub quota may already be exhausted when it runs.
+- In private repositories the picker job runs on Depot (a few seconds per
+  workflow run), because the GitHub quota may already be exhausted when it runs.
+  Depot's runner group does not allow public repositories.
 
-When both GitHub included minutes and Depot's 2,000 minutes/month are exhausted,
-jobs will not start unless additional capacity is available.
+Depot usage caps (organization settings): GitHub Actions 60,000 minutes/month,
+container builds 500, Depot CI 2,000. When a cap is reached, Depot jobs do not
+start until the next billing period or until the cap is raised.
 
 ## Callers
 
