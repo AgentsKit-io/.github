@@ -1,0 +1,4 @@
+# Depot runner labels are provided by the organization's Depot GitHub App.
+self-hosted-runner:
+  labels:
+    - depot-ubuntu-24.04

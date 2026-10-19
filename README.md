@@ -140,6 +140,12 @@ actionlint and should be exercised by a caller repository with the graph
 enabled. Scorecard runs on PRs and on pushes to the default branch because the
 upstream action only accepts the default branch for push events.
 
+## Runner selection
+
+Private repositories can use [pick-runner](docs/pick-runner.md) to select
+GitHub-hosted runners while included minutes remain and Depot afterward.
+Public repositories always get free GitHub-hosted runners, picker included.
+
 ## Renovate organization preset
 
 Repositories opt in by adding a `renovate.json` file:

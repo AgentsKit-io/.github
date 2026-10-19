@@ -1,0 +1,131 @@
+name: Pick Runner
+
+on:
+  workflow_call:
+    inputs:
+      min_remaining:
+        description: Included minutes that must remain to use GitHub
+        type: number
+        default: 100
+      variant:
+        description: "Runner variant: '', arm, 4, or 8"
+        type: string
+        default: ''
+      force_runner:
+        description: Runner label override
+        type: string
+        default: ''
+      included_minutes:
+        description: Monthly included minutes of the organization plan
+        type: number
+        default: 2000
+    secrets:
+      ORG_BILLING_TOKEN:
+        required: false
+    outputs:
+      runner:
+        description: Selected runner label
+        value: ${{ jobs.pick.outputs.runner }}
+
+permissions: {}
+
+jobs:
+  pick:
+    # Public repositories run on GitHub-hosted runners (free there); Depot is for private ones.
+    runs-on: ${{ github.event.repository.private == false && 'ubuntu-latest' || 'depot-ubuntu-24.04' }}
+    timeout-minutes: 3
+    permissions: {}
+    outputs:
+      runner: ${{ steps.pick.outputs.runner }}
+    steps:
+      - name: Select runner
+        id: pick
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.ORG_BILLING_TOKEN }}
+          ORG: ${{ github.repository_owner }}
+          MIN_REMAINING: ${{ inputs.min_remaining }}
+          VARIANT: ${{ inputs.variant }}
+          FORCE_RUNNER: ${{ inputs.force_runner }}
+          REPO_PRIVATE: ${{ github.event.repository.private }}
+          INCLUDED_MINUTES: ${{ inputs.included_minutes }}
+        run: |
+          set -euo pipefail
+          runner=depot-ubuntu-24.04
+          [[ "$VARIANT" != arm ]] || runner=depot-ubuntu-24.04-arm
+          used=unknown
+          remaining=unknown
+          reason='billing unavailable'
+          warn() {
+            local message=$1
+            message=${message//'%'/'%25'}
+            message=${message//$'\r'/'%0D'}
+            message=${message//$'\n'/'%0A'}
+            printf '::warning::%s\n' "$message"
+          }
+          if [[ -n "$FORCE_RUNNER" ]]; then
+            runner=$FORCE_RUNNER
+            reason='forced by caller'
+          elif [[ "$REPO_PRIVATE" == false ]]; then
+            runner=ubuntu-latest
+            [[ "$VARIANT" != arm ]] || runner=ubuntu-24.04-arm
+            [[ "$VARIANT" != 4 && "$VARIANT" != 8 ]] || warn 'Larger runners are not used on public repositories; using ubuntu-latest'
+            reason='public repository: GitHub-hosted runners are free'
+          elif [[ "$VARIANT" == 4 || "$VARIANT" == 8 ]]; then
+            runner="depot-ubuntu-24.04-$VARIANT"
+            reason='larger runners require Depot'
+          elif [[ -z "$GH_TOKEN" ]]; then
+            warn 'ORG_BILLING_TOKEN is missing; using Depot'
+          else
+            work=$(mktemp -d)
+            trap 'rm -rf "$work"' EXIT
+            year=$(date -u +%Y)
+            month=$(date -u +%-m)
+            # Suppress raw API errors: never log authentication or response data.
+            if ! gh api --paginate --slurp -H 'X-GitHub-Api-Version: 2022-11-28' \
+              "/organizations/$ORG/settings/billing/usage?year=$year&month=$month" > "$work/usage.json" 2>/dev/null; then
+              warn 'Billing API failed; using Depot'
+            elif ! gh api --paginate --slurp -H 'X-GitHub-Api-Version: 2022-11-28' \
+              "/orgs/$ORG/repos?type=private&per_page=100" > "$work/repos.json" 2>/dev/null; then
+              warn 'Private repository API failed; using Depot'
+            elif ! jq -e --slurpfile repos "$work/repos.json" '
+              def multiplier:
+                if test("^Actions Linux( |$)"; "i") then 1
+                elif test("^Actions Windows( |$)"; "i") then 2
+                elif test("^Actions macOS( |$)"; "i") then 10
+                else 1 end;
+              if type != "array" or any(.[]; (.usageItems | type) != "array")
+                then error("invalid usage response") else . end |
+              ($repos[0] | if type != "array" or any(.[]; type != "array")
+                then error("invalid repos response") else add // [] end |
+                map(if (.name | type) != "string" or (.private | type) != "boolean"
+                  then error("invalid repository") else select(.private) | .name end)) as $private |
+              [.[].usageItems[] |
+                select((.product | ascii_downcase) == "actions") |
+                select((.unitType | ascii_downcase) == "minutes") |
+                select(.repositoryName as $name | $private | index($name)) |
+                if (.quantity | type) != "number" or .quantity < 0 or (.sku | type) != "string"
+                  then error("invalid minute item") else . end] |
+              {used: (map(.quantity * (.sku | multiplier)) | add // 0),
+               unknown: ([.[].sku | select(test("^Actions (Linux|Windows|macOS)( |$)"; "i") | not)] | unique)}
+              ' "$work/usage.json" > "$work/calculated.json" 2>/dev/null; then
+              warn 'Billing or repository JSON is invalid; using Depot'
+            else
+              while IFS= read -r sku; do
+                warn "Unknown minute SKU $sku; counting with multiplier 1"
+              done < <(jq -r '.unknown[] | @json' "$work/calculated.json")
+              used=$(jq -r '.used' "$work/calculated.json")
+              remaining=$(jq -n --argjson included "$INCLUDED_MINUTES" --argjson used "$used" '$included - $used')
+              if jq -en --argjson remaining "$remaining" --argjson minimum "$MIN_REMAINING" '$remaining > $minimum' > /dev/null; then
+                runner=ubuntu-latest
+                [[ "$VARIANT" != arm ]] || runner=ubuntu-24.04-arm
+                reason='included minutes above threshold'
+              else
+                reason='included minutes at or below threshold'
+              fi
+            fi
+          fi
+          printf 'runner=%s; used=%s; remaining=%s; reason=%s\n' "$runner" "$used" "$remaining" "$reason" | tee -a "$GITHUB_STEP_SUMMARY"
+          # A delimiter preserves force_runner verbatim without interpreting workflow commands.
+          delimiter="runner_${RANDOM}_${RANDOM}_${RANDOM}"
+          printf 'runner<<%s\n%s\n%s\n' "$delimiter" "$runner" "$delimiter" >> "$GITHUB_OUTPUT"
