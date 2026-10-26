@@ -20,6 +20,10 @@ on:
         description: "Dependency install: auto (by lockfile), none, or a shell command."
         type: string
         default: auto
+      pnpm-version:
+        description: "pnpm version when the repository has no packageManager field (e.g. 10.33.0); empty: corepack default."
+        type: string
+        default: ""
       runner-label:
         description: Label of the self-hosted runners that take agent jobs.
         type: string
@@ -53,11 +57,13 @@ jobs:
       - name: Install dependencies
         env:
           INSTALL: ${{ inputs.install }}
+          PNPM_VERSION: ${{ inputs.pnpm-version }}
           COREPACK_ENABLE_DOWNLOAD_PROMPT: "0"
           COREPACK_HOME: ${{ runner.temp }}/corepack
         run: |
           mkdir -p "$RUNNER_TEMP/bin" && corepack enable --install-directory "$RUNNER_TEMP/bin" && echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
           export PATH="$RUNNER_TEMP/bin:$PATH"
+          if [ -n "$PNPM_VERSION" ]; then corepack prepare "pnpm@$PNPM_VERSION" --activate; fi
           case "$INSTALL" in
             none) echo "no install" ;;
             auto)
