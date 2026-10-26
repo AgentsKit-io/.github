@@ -1,0 +1,100 @@
+# The factory's agent, one workflow for every repository (AgentsKit-io and NoxCodeSolutions).
+# A repository calls it from .github/workflows/agent.yml (see docs/factory-agent.md). An issue labelled `agent:go` (set by
+# the PM once the issue is ready) is implemented by Claude Code on the self-hosted runners labelled `agent`; the agent opens
+# the PR and enables auto-merge (issues labelled `risco` wait for a human). "@claude" in a comment by a member continues the
+# work on the same issue or PR. Runners are cleaned before and after every job; the account pool key never leaves them.
+name: agent
+
+on:
+  workflow_call:
+    inputs:
+      model:
+        description: Claude model for the agent.
+        type: string
+        default: sonnet
+      max-turns:
+        description: Turn budget of one run.
+        type: number
+        default: 80
+      install:
+        description: "Dependency install: auto (by lockfile), none, or a shell command."
+        type: string
+        default: auto
+      runner-label:
+        description: Label of the self-hosted runners that take agent jobs.
+        type: string
+        default: agent
+
+jobs:
+  agent:
+    if: >-
+      (github.event_name == 'issues' && github.event.label.name == 'agent:go') ||
+      (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude') &&
+       contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association))
+    runs-on: [self-hosted, "${{ inputs.runner-label }}"]
+    timeout-minutes: 90
+    concurrency:
+      group: agent-${{ github.repository }}-${{ github.event.issue.number }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Node version
+        id: node
+        run: |
+          v=22
+          [ -f .nvmrc ] && v=$(tr -d 'v \n' < .nvmrc)
+          [ -f .node-version ] && v=$(tr -d 'v \n' < .node-version)
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ steps.node.outputs.version }}
+      - name: Install dependencies
+        env:
+          INSTALL: ${{ inputs.install }}
+          COREPACK_ENABLE_DOWNLOAD_PROMPT: "0"
+          COREPACK_HOME: ${{ runner.temp }}/corepack
+        run: |
+          corepack enable --install-directory "$RUNNER_TEMP/bin" && echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+          export PATH="$RUNNER_TEMP/bin:$PATH"
+          case "$INSTALL" in
+            none) echo "no install" ;;
+            auto)
+              if [ -f pnpm-lock.yaml ]; then pnpm install --frozen-lockfile
+              elif [ -f package-lock.json ]; then npm ci
+              elif [ -f yarn.lock ]; then yarn install --immutable || yarn install --frozen-lockfile
+              else echo "no lockfile: no install"; fi ;;
+            *) bash -c "$INSTALL" ;;
+          esac
+      - name: Pool key (stays on the runner host, masked)
+        run: |
+          key=$(cat "$HOME/.pool-key")
+          echo "::add-mask::$key"
+          echo "POOL_KEY=$key" >> "$GITHUB_ENV"
+      - id: claude
+        uses: anthropics/claude-code-action@925afb53776cf1a2b738c6bdbed37b4d4000ef13 # v1
+        with:
+          anthropic_api_key: ${{ env.POOL_KEY }}
+          label_trigger: "agent:go"
+          branch_prefix: "agent/"
+          settings: >-
+            {"env": {"ANTHROPIC_BASE_URL": "http://100.87.168.68:8317",
+                     "HTTP_PROXY": "http://127.0.0.1:8317", "HTTPS_PROXY": "http://127.0.0.1:8317",
+                     "NO_PROXY": "127.0.0.1,localhost,::1"}}
+          claude_args: >-
+            --model ${{ inputs.model }} --max-turns ${{ inputs.max-turns }}
+            --allowedTools "Edit,MultiEdit,Write,Read,Glob,Grep,LS,Bash(pnpm:*),Bash(npm:*),Bash(npx:*),Bash(yarn:*),Bash(node:*),Bash(git:*),Bash(ls:*),Bash(cat:*),Bash(mkdir:*),Bash(curl -sI:*),Bash(curl -s -o /dev/null:*),Bash(gh pr create:*),Bash(gh pr merge:*),Bash(gh pr list:*),Bash(gh pr view:*),Bash(gh pr edit:*)"
+            --append-system-prompt "Follow the repository's AGENTS.md / CLAUDE.md / CONTRIBUTING.md (package manager, changesets, commit rules). Before finishing, the repository's typecheck/lint and the tests of the files you changed must pass; commit everything on this branch and push it. Then, for work started from an issue, open the pull request yourself: gh pr create --base <the default branch> --title <the issue title> --body Closes #<issue number>; then, unless the issue has the label risco, run gh pr merge <number> --auto --squash. If a PR for this branch already exists, push to it instead of opening another. If the issue is not clear enough to verify the result, do not guess: say what is missing in your comment and stop."
+      - name: Check that the work reached a PR
+        if: github.event_name == 'issues' && steps.claude.outputs.branch_name != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH: ${{ steps.claude.outputs.branch_name }}
+          BASE: ${{ github.event.repository.default_branch }}
+        run: |
+          git fetch origin "$BRANCH" 2>/dev/null || { echo "no branch pushed: nothing to deliver"; exit 0; }
+          [ "$(git rev-list --count "origin/$BASE..origin/$BRANCH")" -gt 0 ] || { echo "branch has no commits"; exit 0; }
+          pr=$(gh pr list --head "$BRANCH" --state all --json number --jq '.[0].number')
+          [ -n "$pr" ] || { echo "::error::branch $BRANCH has commits but no PR: the agent did not open it"; exit 1; }
+          echo "PR #$pr"
