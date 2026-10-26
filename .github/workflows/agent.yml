@@ -24,6 +24,10 @@ on:
         description: "pnpm version when the repository has no packageManager field (e.g. 10.33.0); empty: corepack default."
         type: string
         default: ""
+      hosted:
+        description: "Run on a GitHub-hosted runner that joins Tailscale (tag:ci) to reach the account pool. Public repositories only; needs secrets: inherit."
+        type: boolean
+        default: false
       runner-label:
         description: Label of the self-hosted runners that take agent jobs.
         type: string
@@ -35,7 +39,7 @@ jobs:
       (github.event_name == 'issues' && github.event.label.name == 'agent:go') ||
       (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude') &&
        contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association))
-    runs-on: [self-hosted, "${{ inputs.runner-label }}"]
+    runs-on: ${{ inputs.hosted && 'ubuntu-latest' || fromJSON(format('["self-hosted","{0}"]', inputs.runner-label)) }}
     timeout-minutes: 90
     concurrency:
       group: agent-${{ github.repository }}-${{ github.event.issue.number }}
@@ -44,6 +48,14 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+      - name: Join Tailscale (hosted runner reaches the account pool)
+        if: inputs.hosted
+        uses: tailscale/github-action@99a8333667fff04fdd6cffb46dfd409f8329a7bf # v4.3.0
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
+          ping: 100.87.168.68
       - name: Node version
         id: node
         run: |
@@ -73,9 +85,12 @@ jobs:
               else echo "no lockfile: no install"; fi ;;
             *) bash -c "$INSTALL" ;;
           esac
-      - name: Pool key (stays on the runner host, masked)
+      - name: Pool key (from the runner host, or the org secret on hosted runners; masked)
+        env:
+          HOSTED_POOL_KEY: ${{ secrets.FACTORY_POOL_KEY }}
+          HOSTED: ${{ inputs.hosted }}
         run: |
-          key=$(cat "$HOME/.pool-key")
+          if [ "$HOSTED" = true ]; then key="$HOSTED_POOL_KEY"; else key=$(cat "$HOME/.pool-key"); fi
           echo "::add-mask::$key"
           echo "POOL_KEY=$key" >> "$GITHUB_ENV"
       - id: claude
@@ -85,10 +100,7 @@ jobs:
           anthropic_api_key: ${{ env.POOL_KEY }}
           label_trigger: "agent:go"
           branch_prefix: "agent/"
-          settings: >-
-            {"env": {"ANTHROPIC_BASE_URL": "http://100.87.168.68:8317",
-                     "HTTP_PROXY": "http://127.0.0.1:8317", "HTTPS_PROXY": "http://127.0.0.1:8317",
-                     "NO_PROXY": "127.0.0.1,localhost,::1"}}
+          settings: ${{ inputs.hosted && '{"env":{"ANTHROPIC_BASE_URL":"http://100.87.168.68:8317"}}' || '{"env":{"ANTHROPIC_BASE_URL":"http://100.87.168.68:8317","HTTP_PROXY":"http://127.0.0.1:8317","HTTPS_PROXY":"http://127.0.0.1:8317","NO_PROXY":"127.0.0.1,localhost,::1"}}' }}
           claude_args: >-
             --model ${{ inputs.model }} --max-turns ${{ inputs.max-turns }}
             --allowedTools "Edit,MultiEdit,Write,Read,Glob,Grep,LS,Bash(pnpm:*),Bash(npm:*),Bash(npx:*),Bash(yarn:*),Bash(node:*),Bash(git:*),Bash(ls:*),Bash(cat:*),Bash(mkdir:*),Bash(curl -sI:*),Bash(curl -s -o /dev/null:*),Bash(gh pr create:*),Bash(gh pr list:*),Bash(gh pr view:*),Bash(gh pr edit:*)"
@@ -102,10 +114,7 @@ jobs:
           anthropic_api_key: ${{ env.POOL_KEY }}
           label_trigger: "agent:go"
           branch_prefix: "agent/"
-          settings: >-
-            {"env": {"ANTHROPIC_BASE_URL": "http://100.87.168.68:8317",
-                     "HTTP_PROXY": "http://127.0.0.1:8317", "HTTPS_PROXY": "http://127.0.0.1:8317",
-                     "NO_PROXY": "127.0.0.1,localhost,::1"}}
+          settings: ${{ inputs.hosted && '{"env":{"ANTHROPIC_BASE_URL":"http://100.87.168.68:8317"}}' || '{"env":{"ANTHROPIC_BASE_URL":"http://100.87.168.68:8317","HTTP_PROXY":"http://127.0.0.1:8317","HTTPS_PROXY":"http://127.0.0.1:8317","NO_PROXY":"127.0.0.1,localhost,::1"}}' }}
           claude_args: >-
             --model ${{ inputs.model }} --max-turns ${{ inputs.max-turns }}
             --allowedTools "Edit,MultiEdit,Write,Read,Glob,Grep,LS,Bash(pnpm:*),Bash(npm:*),Bash(npx:*),Bash(yarn:*),Bash(node:*),Bash(git:*),Bash(ls:*),Bash(cat:*),Bash(mkdir:*),Bash(curl -sI:*),Bash(curl -s -o /dev/null:*),Bash(gh pr create:*),Bash(gh pr list:*),Bash(gh pr view:*),Bash(gh pr edit:*)"
