@@ -56,7 +56,7 @@ jobs:
           COREPACK_ENABLE_DOWNLOAD_PROMPT: "0"
           COREPACK_HOME: ${{ runner.temp }}/corepack
         run: |
-          corepack enable --install-directory "$RUNNER_TEMP/bin" && echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+          mkdir -p "$RUNNER_TEMP/bin" && corepack enable --install-directory "$RUNNER_TEMP/bin" && echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
           export PATH="$RUNNER_TEMP/bin:$PATH"
           case "$INSTALL" in
             none) echo "no install" ;;
