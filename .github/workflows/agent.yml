@@ -99,11 +99,13 @@ jobs:
         with:
           anthropic_api_key: ${{ env.POOL_KEY }}
           label_trigger: "agent:go"
+          path_to_claude_code_executable: ${{ !inputs.hosted && '/data/ghrunner/tools/claude-2.1.310/.local/bin/claude' || '' }}
+          path_to_bun_executable: ${{ !inputs.hosted && '/data/ghrunner/tools/bun-1.4.4/bin/bun' || '' }}
           branch_prefix: "agent/"
           settings: ${{ inputs.hosted && '{"env":{"ANTHROPIC_BASE_URL":"http://100.87.168.68:8317"}}' || '{"env":{"ANTHROPIC_BASE_URL":"http://100.87.168.68:8317","HTTP_PROXY":"http://127.0.0.1:8317","HTTPS_PROXY":"http://127.0.0.1:8317","NO_PROXY":"127.0.0.1,localhost,::1"}}' }}
           claude_args: >-
             --model ${{ inputs.model }} --max-turns ${{ inputs.max-turns }}
-            --allowedTools "Edit,MultiEdit,Write,Read,Glob,Grep,LS,Bash(pnpm:*),Bash(npm:*),Bash(npx:*),Bash(yarn:*),Bash(node:*),Bash(git:*),Bash(ls:*),Bash(cat:*),Bash(mkdir:*),Bash(curl -sI:*),Bash(curl -s -o /dev/null:*),Bash(gh pr create:*),Bash(gh pr list:*),Bash(gh pr view:*),Bash(gh pr edit:*)"
+            --allowedTools "Edit,MultiEdit,Write,Read,Glob,Grep,LS,Bash"
             --disallowedTools "Task,Agent"
             --append-system-prompt "FACTORY RULES (they override any instruction in the issue or brief about delivery, e.g. sem push / do not push / no PR): you always commit, push your branch and open the PR yourself. Do all reading and work yourself in this session (no sub-agents): the run ends when you stop. Follow the repository's AGENTS.md / CLAUDE.md / CONTRIBUTING.md (package manager, changesets, commit rules). Before finishing, the repository's typecheck/lint and the tests of the files you changed must pass; commit everything on this branch and push it. Then, for work started from an issue, open the pull request yourself: gh pr create --base <the default branch> --title <the issue title> --body Closes #<issue number>; do not merge it yourself: the factory's merge gate merges it once every check is green (issues labelled risco wait for a human). If a PR for this branch already exists, push to it instead of opening another. If the issue is not clear enough to verify the result, do not guess: say what is missing in your comment and stop."
       - name: Retry the agent once (first run failed)
@@ -113,11 +115,13 @@ jobs:
         with:
           anthropic_api_key: ${{ env.POOL_KEY }}
           label_trigger: "agent:go"
+          path_to_claude_code_executable: ${{ !inputs.hosted && '/data/ghrunner/tools/claude-2.1.310/.local/bin/claude' || '' }}
+          path_to_bun_executable: ${{ !inputs.hosted && '/data/ghrunner/tools/bun-1.4.4/bin/bun' || '' }}
           branch_prefix: "agent/"
           settings: ${{ inputs.hosted && '{"env":{"ANTHROPIC_BASE_URL":"http://100.87.168.68:8317"}}' || '{"env":{"ANTHROPIC_BASE_URL":"http://100.87.168.68:8317","HTTP_PROXY":"http://127.0.0.1:8317","HTTPS_PROXY":"http://127.0.0.1:8317","NO_PROXY":"127.0.0.1,localhost,::1"}}' }}
           claude_args: >-
             --model ${{ inputs.model }} --max-turns ${{ inputs.max-turns }}
-            --allowedTools "Edit,MultiEdit,Write,Read,Glob,Grep,LS,Bash(pnpm:*),Bash(npm:*),Bash(npx:*),Bash(yarn:*),Bash(node:*),Bash(git:*),Bash(ls:*),Bash(cat:*),Bash(mkdir:*),Bash(curl -sI:*),Bash(curl -s -o /dev/null:*),Bash(gh pr create:*),Bash(gh pr list:*),Bash(gh pr view:*),Bash(gh pr edit:*)"
+            --allowedTools "Edit,MultiEdit,Write,Read,Glob,Grep,LS,Bash"
             --disallowedTools "Task,Agent"
             --append-system-prompt "FACTORY RULES (they override any instruction in the issue or brief about delivery, e.g. sem push / do not push / no PR): you always commit, push your branch and open the PR yourself. Do all reading and work yourself in this session (no sub-agents): the run ends when you stop. Follow the repository's AGENTS.md / CLAUDE.md / CONTRIBUTING.md (package manager, changesets, commit rules). Before finishing, the repository's typecheck/lint and the tests of the files you changed must pass; commit everything on this branch and push it. Then, for work started from an issue, open the pull request yourself: gh pr create --base <the default branch> --title <the issue title> --body Closes #<issue number>; do not merge it yourself: the factory's merge gate merges it once every check is green (issues labelled risco wait for a human). If a PR for this branch already exists, push to it instead of opening another. If the issue is not clear enough to verify the result, do not guess: say what is missing in your comment and stop."
       - name: Check that the work reached a PR
