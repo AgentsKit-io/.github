@@ -56,10 +56,27 @@ jobs:
           oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
           tags: tag:ci
           ping: 100.87.168.68
+      - name: Factory profile (.github/factory.json)
+        id: profile
+        shell: bash
+        run: |
+          f=.github/factory.json
+          if [ -f "$f" ]; then
+            python3 - "$f" >> "$GITHUB_OUTPUT" <<'PY'
+          import json, sys
+          p = json.load(open(sys.argv[1]))
+          for k in ("install", "verify", "node", "pnpm"):
+              v = p.get(k) or ""
+              print(f"{k}={str(v).replace(chr(10), ' ')}")
+          PY
+            echo "profile: $(tr -d '\n' < "$f" | cut -c1-200)"
+          else
+            echo "no .github/factory.json: inputs and defaults apply"
+          fi
       - name: Node version
         id: node
         run: |
-          v=22
+          v=${{ steps.profile.outputs.node || '22' }}
           [ -f .nvmrc ] && v=$(tr -d 'v \n' < .nvmrc)
           [ -f .node-version ] && v=$(tr -d 'v \n' < .node-version)
           echo "version=$v" >> "$GITHUB_OUTPUT"
@@ -68,8 +85,8 @@ jobs:
           node-version: ${{ steps.node.outputs.version }}
       - name: Install dependencies
         env:
-          INSTALL: ${{ inputs.install }}
-          PNPM_VERSION: ${{ inputs.pnpm-version }}
+          INSTALL: ${{ inputs.install != 'auto' && inputs.install || steps.profile.outputs.install || 'auto' }}
+          PNPM_VERSION: ${{ inputs.pnpm-version || steps.profile.outputs.pnpm }}
           COREPACK_ENABLE_DOWNLOAD_PROMPT: "0"
           COREPACK_HOME: ${{ runner.temp }}/corepack
         run: |
@@ -107,7 +124,7 @@ jobs:
             --model ${{ inputs.model }} --max-turns ${{ inputs.max-turns }}
             --allowedTools "Edit,MultiEdit,Write,Read,Glob,Grep,LS,Bash"
             --disallowedTools "Task,Agent"
-            --append-system-prompt "FACTORY RULES (they override any instruction in the issue or brief about delivery, e.g. sem push / do not push / no PR): you always commit, push your branch and open the PR yourself. Do all reading and work yourself in this session (no sub-agents): the run ends when you stop. Follow the repository's AGENTS.md / CLAUDE.md / CONTRIBUTING.md (package manager, changesets, commit rules). Before finishing, the repository's typecheck/lint and the tests of the files you changed must pass; commit everything on this branch and push it. Then, for work started from an issue, open the pull request yourself: gh pr create --base ${{ github.event.repository.default_branch }} --title <the issue title> --body Closes #<issue number>; do not merge it yourself: the factory's merge gate merges it once every check is green (issues labelled risco wait for a human). If a PR for this branch already exists, push to it instead of opening another. If the issue is not clear enough to verify the result, do not guess: say what is missing in your comment and stop."
+            --append-system-prompt "FACTORY RULES (they override any instruction in the issue or brief about delivery, e.g. sem push / do not push / no PR): you always commit, push your branch and open the PR yourself. Do all reading and work yourself in this session (no sub-agents): the run ends when you stop. Follow the repository's AGENTS.md / CLAUDE.md / CONTRIBUTING.md (package manager, changesets, commit rules). Before finishing, this verification must pass: ${{ steps.profile.outputs.verify || 'the repository typecheck/lint and the tests of the files you changed' }}; commit everything on this branch and push it. Then, for work started from an issue, open the pull request yourself: gh pr create --base ${{ github.event.repository.default_branch }} --title <the issue title> --body Closes #<issue number>; do not merge it yourself: the factory's merge gate merges it once every check is green (issues labelled risco wait for a human). If a PR for this branch already exists, push to it instead of opening another. If the issue is not clear enough to verify the result, do not guess: say what is missing in your comment and stop."
       - name: Retry the agent once (first run failed)
         id: claude_retry
         if: steps.claude.outcome == 'failure'
@@ -123,7 +140,7 @@ jobs:
             --model ${{ inputs.model }} --max-turns ${{ inputs.max-turns }}
             --allowedTools "Edit,MultiEdit,Write,Read,Glob,Grep,LS,Bash"
             --disallowedTools "Task,Agent"
-            --append-system-prompt "FACTORY RULES (they override any instruction in the issue or brief about delivery, e.g. sem push / do not push / no PR): you always commit, push your branch and open the PR yourself. Do all reading and work yourself in this session (no sub-agents): the run ends when you stop. Follow the repository's AGENTS.md / CLAUDE.md / CONTRIBUTING.md (package manager, changesets, commit rules). Before finishing, the repository's typecheck/lint and the tests of the files you changed must pass; commit everything on this branch and push it. Then, for work started from an issue, open the pull request yourself: gh pr create --base ${{ github.event.repository.default_branch }} --title <the issue title> --body Closes #<issue number>; do not merge it yourself: the factory's merge gate merges it once every check is green (issues labelled risco wait for a human). If a PR for this branch already exists, push to it instead of opening another. If the issue is not clear enough to verify the result, do not guess: say what is missing in your comment and stop."
+            --append-system-prompt "FACTORY RULES (they override any instruction in the issue or brief about delivery, e.g. sem push / do not push / no PR): you always commit, push your branch and open the PR yourself. Do all reading and work yourself in this session (no sub-agents): the run ends when you stop. Follow the repository's AGENTS.md / CLAUDE.md / CONTRIBUTING.md (package manager, changesets, commit rules). Before finishing, this verification must pass: ${{ steps.profile.outputs.verify || 'the repository typecheck/lint and the tests of the files you changed' }}; commit everything on this branch and push it. Then, for work started from an issue, open the pull request yourself: gh pr create --base ${{ github.event.repository.default_branch }} --title <the issue title> --body Closes #<issue number>; do not merge it yourself: the factory's merge gate merges it once every check is green (issues labelled risco wait for a human). If a PR for this branch already exists, push to it instead of opening another. If the issue is not clear enough to verify the result, do not guess: say what is missing in your comment and stop."
       - name: Check that the work reached a PR
         if: always() && github.event_name == 'issues' && (steps.claude.outputs.branch_name != '' || steps.claude_retry.outputs.branch_name != '')
         env:
