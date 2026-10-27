@@ -1,0 +1,362 @@
+# The factory's risk reviewer (2026-10-27): the delegated review of a `risco` PR, run on the self-hosted `agent` runners,
+# never on the owner's Mac. Called by agent.yml when a member comments "@claude risk-review (head <sha7>)" on a PR (the Mac
+# merge gate posts that comment for every PR it holds as risk; see docs/factory-agent.md).
+# 1. Checks out the PR head merged with its base (what will land), installs, runs lint/typecheck/unit/db check/contract
+#    tests with the runner's local Postgres (TEST_DATABASE_URL, PG*); a failing command is re-run on the clean base
+#    (baseline), so a failure that already exists on the base does not block the PR.
+# 2. Claude Code (account pool) reviews the diff against the linked issue criteria and the proof, and decides.
+# 3. APPROVE: comment "APROVADO pela revisão de risco (head <sha7>)" + label `risco:aprovado`; the Mac merge gate merges
+#    (owner token, so the merge triggers the base branch workflows; a GITHUB_TOKEN merge would not). REQUEST_CHANGES:
+#    comment "@claude <changes> (head <sha7>)"; a GITHUB_TOKEN comment triggers no workflow, so the gate relays a short
+#    "@claude" as a member and the agent picks it up. marketing-os (owner exception): never approved for merge; an OK
+#    review only says "PM review: ready for owner-side review".
+# One review per head SHA. The reviewer never pushes, never merges, never touches a real database or a secret.
+name: risk-review
+
+on:
+  workflow_call:
+    inputs:
+      repo:
+        description: Repository of the PR (owner/name); must be the calling repository.
+        type: string
+        required: true
+      pr:
+        description: Pull request number.
+        type: number
+        required: true
+      model:
+        description: Claude model of the reviewer.
+        type: string
+        default: opus
+      max-turns:
+        type: number
+        default: 60
+      install:
+        description: "Dependency install: auto (by lockfile), none, or a shell command."
+        type: string
+        default: auto
+      pnpm-version:
+        type: string
+        default: ""
+      runner-label:
+        type: string
+        default: agent
+
+jobs:
+  review:
+    runs-on: ${{ fromJSON(format('["self-hosted","{0}"]', inputs.runner-label)) }}
+    timeout-minutes: 100
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+    concurrency:
+      group: risk-review-${{ inputs.repo }}-${{ inputs.pr }}
+      cancel-in-progress: false
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ inputs.repo }}
+      N: ${{ inputs.pr }}
+      RR: ${{ github.workspace }}/.risk-review
+    steps:
+      - name: PR state (open, head, base; one review per head)
+        id: pr
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${REPO,,}" != "${GITHUB_REPOSITORY,,}" ]; then echo "::error::repo $REPO is not $GITHUB_REPOSITORY"; exit 1; fi
+          j=$(gh pr view "$N" -R "$REPO" --json state,isDraft,headRefOid,baseRefName,headRefName)
+          state=$(jq -r .state <<<"$j"); head=$(jq -r .headRefOid <<<"$j"); base=$(jq -r .baseRefName <<<"$j")
+          if [ "$state" != OPEN ]; then echo "::notice::PR #$N is $state: no review"; echo "skip=true" >> "$GITHUB_OUTPUT"; exit 0; fi
+          done=$(gh api "repos/$REPO/issues/$N/comments?per_page=100" --paginate --jq \
+            "[.[] | select(.user.login == \"github-actions[bot]\") | select(.body | test(\"risk-review:(approve|changes|owner-side|owner) head=$head\"))] | length" | awk '{s+=$1} END{print s+0}')
+          if [ "$done" -gt 0 ]; then echo "::notice::head ${head:0:7} already reviewed"; echo "skip=true" >> "$GITHUB_OUTPUT"; exit 0; fi
+          { echo "head=$head"; echo "sha7=${head:0:7}"; echo "base=$base"; } >> "$GITHUB_OUTPUT"
+          echo "PR #$N head ${head:0:7} into $base"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: steps.pr.outputs.skip != 'true'
+        with:
+          ref: ${{ steps.pr.outputs.base }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Merge the PR head into its base (local only, never pushed)
+        if: steps.pr.outputs.skip != 'true'
+        id: merge
+        shell: bash
+        env:
+          HEAD_SHA: ${{ steps.pr.outputs.head }}
+          BASE: ${{ steps.pr.outputs.base }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RR"
+          git -c "http.extraheader=AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)" \
+            fetch -q origin "+refs/pull/$N/head:refs/remotes/pr/head"
+          [ "$(git rev-parse pr/head)" = "$HEAD_SHA" ] || { echo "::error::PR head moved during the review"; exit 1; }
+          echo "base_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          if ! git -c user.name=risk-review -c user.email=risk-review@factory.invalid merge --no-edit -q pr/head; then
+            echo "::error::PR #$N conflicts with $BASE"; git merge --abort || true; exit 1
+          fi
+          git branch -f rr-merged HEAD
+          git diff "origin/$BASE...pr/head" > "$RR/diff.patch"
+          git diff --stat "origin/$BASE...pr/head" > "$RR/diffstat.txt"
+          echo "diff: $(wc -l < "$RR/diff.patch") lines"
+      - name: Factory profile (.github/factory.json) and the proof commands
+        if: steps.pr.outputs.skip != 'true'
+        id: profile
+        shell: bash
+        run: |
+          python3 - "$RR" >> "$GITHUB_OUTPUT" <<'PY'
+          import json, os, sys
+          rr = sys.argv[1]
+          p = json.load(open(".github/factory.json")) if os.path.exists(".github/factory.json") else {}
+          for k in ("install", "node", "pnpm"):
+              print(f"{k}={str(p.get(k) or '').replace(chr(10), ' ')}")
+          scripts = {}
+          if os.path.exists("package.json"):
+              scripts = (json.load(open("package.json")).get("scripts") or {})
+          pm = "pnpm" if os.path.exists("pnpm-lock.yaml") else "yarn" if os.path.exists("yarn.lock") else "bun" if (os.path.exists("bun.lockb") or os.path.exists("bun.lock")) else "npm"
+          cmds = []
+          if p.get("verify"):
+              cmds.append(("verify", p["verify"]))
+          else:
+              for names in (["lint"], ["typecheck", "check-types"], ["db:check"], ["test:unit"], ["test"]):
+                  k = next((n for n in names if n in scripts), None)
+                  if k: cmds.append((k.replace(":", "-"), f"{pm} run {k}"))
+          joined = " ".join(c for _, c in cmds) + " " + " ".join(scripts.get(n, "") for n in ("test", "verify", "check"))
+          if p.get("contract"):
+              cmds.append(("contract", p["contract"]))
+          elif "test:contract" in scripts and "test:contract" not in joined and "test:contract" not in str(p.get("verify", "")):
+              cmds.append(("test-contract", f"{pm} run test:contract"))
+          diff = open(os.path.join(rr, "diffstat.txt")).read()
+          if "build" in scripts and ("web" in diff or "app/" in diff) and "build" not in joined:
+              cmds.append(("build", f"{pm} run build"))
+          with open(os.path.join(rr, "cmds.tsv"), "w") as f:
+              for n, c in cmds: f.write(f"{n}\t{c.replace(chr(10), ' ')}\n")
+          PY
+          echo "proof commands:"; cat "$RR/cmds.tsv" || true
+      - name: Node version
+        if: steps.pr.outputs.skip != 'true'
+        id: node
+        run: |
+          v=${{ steps.profile.outputs.node || '22' }}
+          [ -f .nvmrc ] && v=$(tr -d 'v \n' < .nvmrc)
+          [ -f .node-version ] && v=$(tr -d 'v \n' < .node-version)
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        if: steps.pr.outputs.skip != 'true'
+        with:
+          node-version: ${{ steps.node.outputs.version }}
+      - name: Proof on the merged tree (install, lint, typecheck, unit, contract with the local Postgres)
+        if: steps.pr.outputs.skip != 'true'
+        shell: bash
+        env:
+          INSTALL: ${{ inputs.install != 'auto' && inputs.install || steps.profile.outputs.install || 'auto' }}
+          PNPM_VERSION: ${{ inputs.pnpm-version || steps.profile.outputs.pnpm }}
+          COREPACK_ENABLE_DOWNLOAD_PROMPT: "0"
+          COREPACK_HOME: ${{ runner.temp }}/corepack
+        run: |
+          set -u
+          mkdir -p "$RUNNER_TEMP/bin" && corepack enable --install-directory "$RUNNER_TEMP/bin" && echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+          export PATH="$RUNNER_TEMP/bin:$PATH"
+          if [ -n "$PNPM_VERSION" ]; then corepack prepare "pnpm@$PNPM_VERSION" --activate; fi
+          cat > "$RUNNER_TEMP/rr-install.sh" <<'SH'
+          case "$INSTALL" in
+            none) echo "no install" ;;
+            auto)
+              if [ -f pnpm-lock.yaml ]; then pnpm install --frozen-lockfile
+              elif [ -f package-lock.json ]; then npm ci
+              elif [ -f yarn.lock ]; then yarn install --immutable || yarn install --frozen-lockfile
+              elif [ -f bun.lockb ] || [ -f bun.lock ]; then bun install --frozen-lockfile
+              else echo "no lockfile: no install"; fi ;;
+            *) bash -c "$INSTALL" ;;
+          esac
+          SH
+          # Every proof command runs with a throwaway HOME (tests never touch the runner's HOME) and the runner's local
+          # test database; DATABASE_URL points at it only when the job has none.
+          cat > "$RUNNER_TEMP/rr-proof.sh" <<'SH'
+          out=$1; only=${2:-}; mkdir -p "$out"; : > "$out/summary.tsv"
+          s=$(date +%s); bash "$RUNNER_TEMP/rr-install.sh" > "$out/install.log" 2>&1; rc=$?
+          printf 'install\t%s\t%s\t%s\n' "$rc" "$(( $(date +%s) - s ))" "$INSTALL" >> "$out/summary.tsv"
+          h=$(mktemp -d)
+          while IFS=$'\t' read -r name cmd; do
+            [ -n "$name" ] || continue
+            if [ -n "$only" ] && ! grep -qx "$name" <<<"$only"; then continue; fi
+            s=$(date +%s)
+            HOME=$h DATABASE_URL=${DATABASE_URL:-${TEST_DATABASE_URL:-}} CI=true timeout 1500 bash -c "$cmd" > "$out/$name.log" 2>&1; rc=$?
+            printf '%s\t%s\t%s\t%s\n' "$name" "$rc" "$(( $(date +%s) - s ))" "$cmd" >> "$out/summary.tsv"
+          done < "$RR/cmds.tsv"
+          rm -rf "$h"
+          SH
+          [ -n "${TEST_DATABASE_URL:-}" ] && echo "local test database: yes" || echo "::warning::no TEST_DATABASE_URL on this runner"
+          bash "$RUNNER_TEMP/rr-proof.sh" "$RR/merged"
+          column -t -s $'\t' "$RR/merged/summary.tsv" || cat "$RR/merged/summary.tsv"
+      - name: Baseline (failed commands again on the clean base)
+        if: steps.pr.outputs.skip != 'true'
+        shell: bash
+        env:
+          INSTALL: ${{ inputs.install != 'auto' && inputs.install || steps.profile.outputs.install || 'auto' }}
+          COREPACK_ENABLE_DOWNLOAD_PROMPT: "0"
+          COREPACK_HOME: ${{ runner.temp }}/corepack
+          BASE_SHA: ${{ steps.merge.outputs.base_sha }}
+        run: |
+          set -u
+          failed=$(awk -F'\t' '$1 != "install" && $2 != 0 {print $1}' "$RR/merged/summary.tsv")
+          installrc=$(awk -F'\t' '$1 == "install" {print $2}' "$RR/merged/summary.tsv")
+          if [ -z "$failed" ] && [ "$installrc" = 0 ]; then echo "everything passed on the merged tree: no baseline"; exit 0; fi
+          [ -n "$failed" ] || failed=$(cut -f1 "$RR/cmds.tsv")
+          echo "baseline for: $(echo $failed)"
+          mv "$RR" "$RUNNER_TEMP/rr-keep"
+          git checkout -q -f "$BASE_SHA" && git clean -q -ffdx
+          mv "$RUNNER_TEMP/rr-keep" "$RR"
+          bash "$RUNNER_TEMP/rr-proof.sh" "$RR/base" "$failed"
+          column -t -s $'\t' "$RR/base/summary.tsv" || cat "$RR/base/summary.tsv"
+          mv "$RR" "$RUNNER_TEMP/rr-keep"
+          git checkout -q -f rr-merged && git clean -q -ffdx -e node_modules
+          mv "$RUNNER_TEMP/rr-keep" "$RR"
+      - name: Review context (PR, linked issues, comments, proof)
+        if: steps.pr.outputs.skip != 'true'
+        shell: bash
+        run: |
+          set -uo pipefail
+          gh pr view "$N" -R "$REPO" --json number,title,body,author,headRefName,baseRefName,labels,files,closingIssuesReferences > "$RR/pr.json"
+          gh api "repos/$REPO/issues/$N/comments?per_page=100" --jq '.[-30:][] | "--- \(.user.login) \(.created_at)\n\(.body)\n"' > "$RR/comments.md" || true
+          issues=$( { jq -r '.closingIssuesReferences[]?.number' "$RR/pr.json"
+                      jq -r '.title | capture("#(?<n>[0-9]+):")?.n // empty' "$RR/pr.json"
+                      jq -r '.body // "" | [scan("(?i)(?:closes|fixes|resolves|refs) #([0-9]+)")[]] | .[]' "$RR/pr.json"; } | sort -un)
+          : > "$RR/issues.md"
+          for i in $issues; do
+            gh issue view "$i" -R "$REPO" --json number,title,body,labels \
+              --jq '"# Issue #\(.number): \(.title)\nlabels: \([.labels[].name]|join(", "))\n\n\(.body)\n"' >> "$RR/issues.md" || true
+          done
+          [ -s "$RR/issues.md" ] || echo "(no linked issue found)" > "$RR/issues.md"
+          {
+            echo "# Proof run on the runner"
+            for side in merged base; do
+              [ -f "$RR/$side/summary.tsv" ] || continue
+              echo; echo "## $side (name, exit code, seconds, command)"; cat "$RR/$side/summary.tsv"
+              awk -F'\t' '$2 != 0 {print $1}' "$RR/$side/summary.tsv" | while read -r f; do
+                echo; echo "### $side/$f.log (last 120 lines)"; tail -n 120 "$RR/$side/$f.log"
+              done
+            done
+            [ -s "$RR/cmds.tsv" ] || echo "No proof command found (no factory.json verify and no lint/typecheck/test scripts)."
+          } > "$RR/proof.md"
+          wc -c "$RR"/*.md "$RR/diff.patch"
+      - name: Pool key (from the runner host; masked)
+        if: steps.pr.outputs.skip != 'true'
+        run: |
+          key=$(cat "$HOME/.pool-key")
+          echo "::add-mask::$key"
+          echo "POOL_KEY=$key" >> "$GITHUB_ENV"
+      - name: Review (Claude Code, account pool)
+        id: claude
+        if: steps.pr.outputs.skip != 'true'
+        continue-on-error: true
+        uses: anthropics/claude-code-action@925afb53776cf1a2b738c6bdbed37b4d4000ef13 # v1
+        with:
+          anthropic_api_key: ${{ env.POOL_KEY }}
+          github_token: ${{ github.token }}
+          path_to_claude_code_executable: /data/ghrunner/tools/claude-2.1.310/.local/bin/claude
+          path_to_bun_executable: /data/ghrunner/tools/bun-1.4.4/bin/bun
+          settings: '{"env":{"ANTHROPIC_BASE_URL":"http://100.87.168.68:8317","HTTP_PROXY":"http://127.0.0.1:8317","HTTPS_PROXY":"http://127.0.0.1:8317","NO_PROXY":"127.0.0.1,localhost,::1"}}'
+          claude_args: >-
+            --model ${{ inputs.model }} --max-turns ${{ inputs.max-turns }}
+            --allowedTools "Read,Glob,Grep,LS,Write,Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(git blame:*)"
+            --disallowedTools "Task,Agent,Edit,MultiEdit,WebFetch,WebSearch"
+          prompt: |
+            You are the factory's risk reviewer for pull request #${{ inputs.pr }} of ${{ inputs.repo }} (head ${{ steps.pr.outputs.sha7 }}).
+            The owner delegated the merge of risk PRs (payment, withdrawal, auth, migration, production data, infra, CI,
+            secrets) with a mandatory review. Your verdict decides whether this PR is merged. You only review: never push,
+            never comment, never merge, never edit code. The working tree is the PR head merged with its base (what will land).
+
+            Inputs, all under .risk-review/: pr.json (title, body, labels, files), issues.md (the linked issue(s) and their
+            acceptance criteria), diff.patch and diffstat.txt (the PR diff against the base), comments.md (recent PR
+            comments), proof.md (the commands run on this runner: install, lint, typecheck, unit, db check, contract
+            tests with a local Postgres, on the merged tree; failing commands re-run on the clean base under "base").
+            Read the files the diff touches in full where needed (Read/Grep/git show).
+
+            Decide:
+            1. Criteria: does the diff deliver what the linked issue asks (every acceptance criterion), nothing unrelated?
+            2. Proof: a command that fails on "merged" and passes (or was not run) on "base" is a NEW failure and blocks.
+               A failure identical on the base is a base bug: note it, do not block on it. Known base bugs: expenses
+               chat.ts:557; techhunter AI stream AK_ADAPTER_STREAM_FAILED and expired magic link; servdex magic-link x3,
+               `received` phone duplicate, auth-Origin flake; agenda-gospel RF-01 auth-origin on workers. In techhunter,
+               expenses and servdex CI only proves lint/typecheck, so the contract suite here is the real proof.
+               No proof command at all, or install failing on the merged tree only, blocks.
+            3. Risks: data loss; destructive migration without backfill/down path; migration number clashing with the base;
+               drizzle journal/snapshot missing; auth bypass or data exposed without login; money moved wrongly or twice
+               (idempotency, concurrent webhook replay, signature verification); secrets committed; CI weakened (tests
+               deleted, new continue-on-error, jobs skipped without an issue); stray files (root pnpm-lock.yaml in a
+               sub-app repo). A PR whose linked issue says Depends-On an issue that is still open waits (REQUEST_CHANGES
+               with "wait for #n" only if the dependency is visible in issues.md).
+            4. Production secrets, production deploys or a business decision only the owner can take: REQUEST_CHANGES is
+               wrong for these; use verdict "OWNER" and say the question in one line.
+
+            Write your decision as JSON to .risk-review/verdict.json and then stop:
+            {"verdict": "APPROVE" | "REQUEST_CHANGES" | "OWNER",
+             "summary": ["<what vs criteria>", "<proof run and result>", "<risk>"],
+             "changes": "<for REQUEST_CHANGES: exact, actionable changes for the coding agent, as a short list; else empty>",
+             "question": "<for OWNER: the question; else empty>"}
+            The three summary lines are in Portuguese (Brazil), one line each. "changes" is in English.
+      - name: Apply the verdict (comment, label)
+        if: steps.pr.outputs.skip != 'true'
+        shell: bash
+        env:
+          HEAD_SHA: ${{ steps.pr.outputs.head }}
+          SHA7: ${{ steps.pr.outputs.sha7 }}
+          CLAUDE_OUTCOME: ${{ steps.claude.outcome }}
+        run: |
+          set -uo pipefail
+          now=$(gh pr view "$N" -R "$REPO" --json state,headRefOid --jq '"\(.state) \(.headRefOid)"')
+          if [ "$now" != "OPEN $HEAD_SHA" ]; then echo "::notice::PR moved during the review ($now): no verdict posted"; exit 0; fi
+          python3 - "$RR" > "$RUNNER_TEMP/rr-out" <<'PY'
+          import json, os, sys
+          rr = sys.argv[1]; repo = os.environ["REPO"]; head = os.environ["HEAD_SHA"]; sha7 = os.environ["SHA7"]
+          try:
+              v = json.load(open(os.path.join(rr, "verdict.json")))
+          except Exception as e:
+              v = {"verdict": "ERROR", "summary": [], "changes": "", "question": f"no verdict ({e.__class__.__name__}, claude {os.environ.get('CLAUDE_OUTCOME')})"}
+          verdict = str(v.get("verdict", "ERROR")).upper()
+          def rows(side):
+              p = os.path.join(rr, side, "summary.tsv")
+              return {l.split("\t")[0]: l.split("\t")[1] for l in open(p).read().splitlines() if l} if os.path.exists(p) else {}
+          merged, base = rows("merged"), rows("base")
+          # Deterministic floor under the model: a command failing on the merged tree and passing on the base blocks.
+          new = [n for n, rc in merged.items() if rc != "0" and base.get(n, "1") == "0"]
+          if verdict == "APPROVE" and new:
+              verdict = "REQUEST_CHANGES"
+              v["changes"] = (v.get("changes") or "") + f"\n- These commands fail on the PR merged with its base and pass on the base: {', '.join(sorted(set(new)))}. Fix them and run them before pushing."
+          proof = ", ".join(f"{n}={'ok' if rc == '0' else 'FALHOU'}" for n, rc in merged.items()) or "nenhum comando"
+          summary = [str(s) for s in (v.get("summary") or [])][:3]
+          lines = "\n".join(f"- {s}" for s in summary)
+          marker = lambda kind: f"\n\n<!-- risk-review:{kind} head={head} -->"
+          mos = repo.lower() == "agentskit-io/marketing-os"
+          if verdict == "APPROVE" and mos:
+              kind, body = "owner-side", f"PM review: ready for owner-side review (head {sha7})\n\nRevisão do PM (delegada pelo dono):\n{lines}\n- Prova no runner: {proof}"
+          elif verdict == "APPROVE":
+              kind, body = "approve", f"APROVADO pela revisão de risco (head {sha7})\n\nRevisão do PM (delegada pelo dono):\n{lines}\n- Prova no runner: {proof}"
+          elif verdict == "REQUEST_CHANGES":
+              kind, body = "changes", f"@claude {str(v.get('changes') or '').strip()} (head {sha7})\n\nRevisão de risco: mudanças necessárias.\n{lines}\n- Prova no runner: {proof}"
+          elif verdict == "OWNER":
+              kind, body = "owner", f"Revisão de risco (head {sha7}): precisa do dono.\n\n{v.get('question', '')}\n{lines}\n- Prova no runner: {proof}"
+          else:
+              kind, body = "error", f"Revisão de risco não concluída (head {sha7}): {v.get('question') or verdict}. A fábrica tenta de novo."
+          open(os.path.join(rr, "comment.md"), "w").write(body + marker(kind))
+          print(kind)
+          PY
+          kind=$(cat "$RUNNER_TEMP/rr-out")
+          echo "verdict: $kind"; cat "$RR/comment.md"
+          gh pr comment "$N" -R "$REPO" --body-file "$RR/comment.md"
+          if [ "$kind" = approve ]; then
+            gh label create risco:aprovado -R "$REPO" --color 0E8A16 --description "Aprovado pela revisão de risco (o portão mergeia)" >/dev/null 2>&1 || true
+            gh pr edit "$N" -R "$REPO" --add-label risco:aprovado
+          else
+            gh pr edit "$N" -R "$REPO" --remove-label risco:aprovado >/dev/null 2>&1 || true
+          fi
+          {
+            echo "### Risk review: $kind (head $SHA7)"; echo; cat "$RR/comment.md"; echo
+            for side in merged base; do [ -f "$RR/$side/summary.tsv" ] && { echo; echo "$side:"; echo '```'; cat "$RR/$side/summary.tsv"; echo '```'; }; done
+          } >> "$GITHUB_STEP_SUMMARY"
+          [ "$kind" != error ] || exit 1
+      - name: Clean the work dir (no PR code or key left on the runner)
+        if: always()
+        run: rm -rf "${{ github.workspace }}"/* "${{ github.workspace }}"/.[!.]* 2>/dev/null || true
