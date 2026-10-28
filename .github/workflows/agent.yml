@@ -3,6 +3,8 @@
 # the PM once the issue is ready) is implemented by Claude Code on the self-hosted runners labelled `agent`; the agent opens
 # the PR; the factory's merge gate merges it when every check is green (issues labelled `risco` wait for a human). "@claude" in a comment by a member continues the
 # work on the same issue or PR. Runners are cleaned before and after every job; the account pool key never leaves them.
+# Factory v3 cutover: with the org/repo variable FACTORY_LINE=on, `agent:go` no longer starts this job (the Hatchet line
+# on the factory machines takes the tickets); "@claude" comments keep working.
 name: agent
 
 on:
@@ -36,7 +38,7 @@ on:
 jobs:
   agent:
     if: >-
-      (github.event_name == 'issues' && github.event.label.name == 'agent:go') ||
+      (github.event_name == 'issues' && github.event.label.name == 'agent:go' && vars.FACTORY_LINE != 'on') ||
       (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude') &&
        !contains(github.event.comment.body, '@claude risk-review') &&
        contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association))
