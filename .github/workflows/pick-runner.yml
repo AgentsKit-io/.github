@@ -19,24 +19,50 @@ on:
         description: Monthly included minutes of the organization plan
         type: number
         default: 2000
+      fallback_runner:
+        description: >-
+          JSON runs-on value used instead of Depot when GitHub minutes are out, for example
+          '["self-hosted","docker"]' (organizations without Depot). Empty keeps Depot.
+        type: string
+        default: ''
+      cached_remaining:
+        description: >-
+          Remaining included minutes from a cache the caller passes (for example an organization
+          variable written by a factory job). Used only with fallback_runner and when ORG_BILLING_TOKEN is absent.
+        type: string
+        default: ''
+      cached_at:
+        description: UTC ISO-8601 time the cache was written; older than 36 h or another month counts as unknown.
+        type: string
+        default: ''
     secrets:
       ORG_BILLING_TOKEN:
         required: false
     outputs:
       runner:
-        description: Selected runner label
+        description: Selected runner label (with fallback_runner, may be a JSON array; use runs_on)
         value: ${{ jobs.pick.outputs.runner }}
+      runs_on:
+        description: 'Selected runner as JSON, for runs-on: fromJSON(...)'
+        value: ${{ jobs.pick.outputs.runs_on }}
 
 permissions: {}
 
 jobs:
   pick:
     # Public repositories run on GitHub-hosted runners (free there); Depot is for private ones.
-    runs-on: ${{ github.event.repository.private == false && 'ubuntu-latest' || 'depot-ubuntu-24.04' }}
+    # With fallback_runner (no Depot): GitHub-hosted only while the cache says minutes remain, else the fallback.
+    runs-on: >-
+      ${{ inputs.fallback_runner == ''
+        && (github.event.repository.private == false && 'ubuntu-latest' || 'depot-ubuntu-24.04')
+        || ((github.event.repository.private == false
+             || fromJSON(inputs.cached_remaining || '0') > inputs.min_remaining)
+            && 'ubuntu-latest' || fromJSON(inputs.fallback_runner || '"ubuntu-latest"')) }}
     timeout-minutes: 3
     permissions: {}
     outputs:
       runner: ${{ steps.pick.outputs.runner }}
+      runs_on: ${{ steps.pick.outputs.runs_on }}
     steps:
       - name: Select runner
         id: pick
@@ -49,10 +75,23 @@ jobs:
           FORCE_RUNNER: ${{ inputs.force_runner }}
           REPO_PRIVATE: ${{ github.event.repository.private }}
           INCLUDED_MINUTES: ${{ inputs.included_minutes }}
+          FALLBACK_RUNNER: ${{ inputs.fallback_runner }}
+          CACHED_REMAINING: ${{ inputs.cached_remaining }}
+          CACHED_AT: ${{ inputs.cached_at }}
         run: |
           set -euo pipefail
           runner=depot-ubuntu-24.04
           [[ "$VARIANT" != arm ]] || runner=depot-ubuntu-24.04-arm
+          fallback=Depot
+          if [[ -n "${FALLBACK_RUNNER:-}" ]]; then
+            if ! jq -e 'type == "string" or (type == "array" and length > 0 and all(type == "string"))' \
+                <<<"$FALLBACK_RUNNER" > /dev/null 2>&1; then
+              printf '::error::fallback_runner must be a JSON string or array of strings\n'
+              exit 1
+            fi
+            runner=$FALLBACK_RUNNER
+            fallback='the fallback runner'
+          fi
           used=unknown
           remaining=unknown
           reason='billing unavailable'
@@ -71,11 +110,32 @@ jobs:
             [[ "$VARIANT" != arm ]] || runner=ubuntu-24.04-arm
             [[ "$VARIANT" != 4 && "$VARIANT" != 8 ]] || warn 'Larger runners are not used on public repositories; using ubuntu-latest'
             reason='public repository: GitHub-hosted runners are free'
-          elif [[ "$VARIANT" == 4 || "$VARIANT" == 8 ]]; then
+          elif [[ "$VARIANT" == 4 || "$VARIANT" == 8 ]] && [[ -z "${FALLBACK_RUNNER:-}" ]]; then
             runner="depot-ubuntu-24.04-$VARIANT"
             reason='larger runners require Depot'
+          elif [[ -z "$GH_TOKEN" && -n "${FALLBACK_RUNNER:-}" && -n "${CACHED_REMAINING:-}" ]]; then
+            # Cache written by a factory job: trust it only if numeric, from this UTC month and at most 36 h old.
+            now=$(date -u +%s)
+            at=$(jq -nr --arg at "${CACHED_AT:-}" '$at | sub("\\.[0-9]+Z$"; "Z") | try fromdateiso8601 catch 0')
+            if ! [[ "$CACHED_REMAINING" =~ ^-?[0-9]+$ ]]; then
+              warn "Cached remaining minutes is not a number; using $fallback"
+            elif (( now - at > 129600 )) \
+              || [[ "$(jq -nr --argjson t "$at" '$t | strftime("%Y-%m")')" != "$(date -u +%Y-%m)" ]]; then
+              reason='cached minutes stale or from another month'
+              warn "Cached minutes are stale (${CACHED_AT:-no timestamp}); using $fallback"
+            else
+              remaining=$CACHED_REMAINING
+              used=$(( INCLUDED_MINUTES - CACHED_REMAINING ))
+              if (( remaining > MIN_REMAINING )); then
+                runner=ubuntu-latest
+                [[ "$VARIANT" != arm ]] || runner=ubuntu-24.04-arm
+                reason='cached included minutes above threshold'
+              else
+                reason='cached included minutes at or below threshold'
+              fi
+            fi
           elif [[ -z "$GH_TOKEN" ]]; then
-            warn 'ORG_BILLING_TOKEN is missing; using Depot'
+            warn "ORG_BILLING_TOKEN is missing; using $fallback"
           else
             work=$(mktemp -d)
             trap 'rm -rf "$work"' EXIT
@@ -84,10 +144,10 @@ jobs:
             # Suppress raw API errors: never log authentication or response data.
             if ! gh api --paginate --slurp -H 'X-GitHub-Api-Version: 2022-11-28' \
               "/organizations/$ORG/settings/billing/usage?year=$year&month=$month" > "$work/usage.json" 2>/dev/null; then
-              warn 'Billing API failed; using Depot'
+              warn "Billing API failed; using $fallback"
             elif ! gh api --paginate --slurp -H 'X-GitHub-Api-Version: 2022-11-28' \
               "/orgs/$ORG/repos?type=private&per_page=100" > "$work/repos.json" 2>/dev/null; then
-              warn 'Private repository API failed; using Depot'
+              warn "Private repository API failed; using $fallback"
             elif ! jq -e --slurpfile repos "$work/repos.json" '
               def multiplier:
                 if test("^Actions Linux( |$)"; "i") then 1
@@ -109,7 +169,7 @@ jobs:
               {used: (map(.quantity * (.sku | multiplier)) | add // 0),
                unknown: ([.[].sku | select(test("^Actions (Linux|Windows|macOS)( |$)"; "i") | not)] | unique)}
               ' "$work/usage.json" > "$work/calculated.json" 2>/dev/null; then
-              warn 'Billing or repository JSON is invalid; using Depot'
+              warn "Billing or repository JSON is invalid; using $fallback"
             else
               while IFS= read -r sku; do
                 warn "Unknown minute SKU $sku; counting with multiplier 1"
@@ -129,3 +189,10 @@ jobs:
           # A delimiter preserves force_runner verbatim without interpreting workflow commands.
           delimiter="runner_${RANDOM}_${RANDOM}_${RANDOM}"
           printf 'runner<<%s\n%s\n%s\n' "$delimiter" "$runner" "$delimiter" >> "$GITHUB_OUTPUT"
+          # runs_on is always JSON: a fallback array/string as given, a plain label quoted.
+          if [[ "$runner" == '['* || "$runner" == '"'* ]] && jq -e . <<<"$runner" > /dev/null 2>&1; then
+            runs_on=$(jq -c . <<<"$runner")
+          else
+            runs_on=$(jq -cn --arg r "$runner" '$r')
+          fi
+          printf 'runs_on<<%s\n%s\n%s\n' "$delimiter" "$runs_on" "$delimiter" >> "$GITHUB_OUTPUT"
