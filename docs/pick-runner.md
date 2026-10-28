@@ -89,6 +89,38 @@ Set repository or organization variable `FORCE_RUNNER` to override selection,
 for example `depot-ubuntu-24.04` or `ubuntu-latest`. Pass `variant: arm`, `4`, or
 `8` through `with` when needed (quote numeric variants as strings).
 
+## Organizations without Depot (factory runners)
+
+NoxCodeSolutions has no Depot and does not pay for Actions: GitHub-hosted runners only while the included minutes
+last, then the factory's self-hosted runners. Pass `fallback_runner` (a JSON `runs-on` value) and read the
+`runs_on` output with `fromJSON`:
+
+```yaml
+jobs:
+  pick-runner:
+    uses: AgentsKit-io/.github/.github/workflows/pick-runner.yml@main
+    with:
+      fallback_runner: '["self-hosted","docker"]'   # or '["self-hosted","agent"]' for jobs without Docker
+      cached_remaining: ${{ vars.HOSTED_MINUTES_LEFT }}
+      cached_at: ${{ vars.HOSTED_MINUTES_AT }}
+      force_runner: ${{ vars.FORCE_RUNNER }}
+
+  test:
+    needs: [pick-runner]
+    runs-on: ${{ fromJSON(needs.pick-runner.outputs.runs_on) }}
+```
+
+With `fallback_runner`:
+
+- Depot is never used: exhausted minutes, a missing token, API failures, stale caches and larger variants all give
+  the fallback.
+- Without `ORG_BILLING_TOKEN`, `cached_remaining` (remaining included minutes) decides. A factory job writes it as
+  organization variables `HOSTED_MINUTES_LEFT` and `HOSTED_MINUTES_AT` (UTC ISO-8601). A cache older than 36 h or
+  from another month counts as unknown, so the fallback is used.
+- The picker job runs on `ubuntu-latest` only while the cache says minutes remain. Otherwise it runs on the fallback
+  runner, so an exhausted organization spends no hosted minute on picking.
+- `runner` echoes the fallback as given (a JSON array). Use `runs_on`.
+
 ## Local verification
 
 Run `actionlint .github/workflows/*.yml` and
