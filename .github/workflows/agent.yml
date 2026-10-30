@@ -3,6 +3,9 @@
 # the PM once the issue is ready) is implemented by Claude Code on the self-hosted runners labelled `agent`; the agent opens
 # the PR; the factory's merge gate merges it when every check is green (issues labelled `risco` wait for a human). "@claude" in a comment by a member continues the
 # work on the same issue or PR. Runners are cleaned before and after every job; the account pool key never leaves them.
+# The agent runs on the account pool of whoever dispatched the task (the `por:<login>` label put by the factory, the owner
+# when there is none, the author of an "@claude" comment), read on the runner from $HOME/.pools/<login>.env; no pool for
+# the dispatcher: a comment on the issue and no run.
 # Factory v3 cutover: with the org/repo variable FACTORY_LINE=on, `agent:go` no longer starts this job (the Hatchet line
 # on the factory machines takes the tickets); "@claude" comments keep working.
 name: agent
@@ -34,6 +37,14 @@ on:
         description: Label of the self-hosted runners that take agent jobs.
         type: string
         default: agent
+      factory-actors:
+        description: "Logins (comma separated) whose `por:<login>` label names the dispatcher: the factory's App bot and the login of the current release."
+        type: string
+        default: "noxcode-factory[bot],EmersonBraun"
+      default-dispatcher:
+        description: Dispatcher of an issue with no `por:` label (the owner); the only pool on hosted runners (FACTORY_POOL_KEY).
+        type: string
+        default: EmersonBraun
 
 jobs:
   agent:
@@ -85,12 +96,137 @@ jobs:
           else
             echo "::warning::could not check issue #$N for an existing PR: the agent runs"
           fi
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # The task runs on the pool of whoever dispatched it (.github/scripts/dispatcher-pool.sh, embedded here because a
+      # reusable workflow sees only the caller's checkout; scripts/test-dispatcher-pool.sh checks the copy). The runner holds
+      # one file per person, $HOME/.pools/<login>.env; callers pass no secrets, so nothing else could carry them across orgs.
+      # No pool for the dispatcher: a comment on the issue and the agent does not run (never another pool).
+      - name: Pool do despachante (whoever dispatched the task pays it; key masked)
+        id: pool
         if: steps.guard.outputs.skip != 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          REPO: ${{ github.repository }}
+          N: ${{ github.event.issue.number }}
+          ISSUE_LABELS: ${{ toJSON(github.event.issue.labels.*.name) }}
+          COMMENT_AUTHOR: ${{ github.event.comment.user.login }}
+          FACTORY_ACTORS: ${{ inputs.factory-actors }}
+          DEFAULT_DISPATCHER: ${{ inputs.default-dispatcher }}
+          HOSTED: ${{ inputs.hosted }}
+          HOSTED_POOL_KEY: ${{ secrets.FACTORY_POOL_KEY }}
+        run: |
+          cat > "$RUNNER_TEMP/dispatcher-pool.sh" <<'SH'
+          #!/usr/bin/env bash
+          # dispatcher-pool.sh: the "Pool do despachante" step of agent.yml (docs/factory-agent.md). The task runs on the pool of
+          # whoever dispatched it, never on another one.
+          #
+          # 1. Who dispatched: `issues` event: the issue's `por:<login>` label, valid only if its last `labeled` event in the
+          #    timeline was made by one of FACTORY_ACTORS; no `por:` label: DEFAULT_DISPATCHER (the owner). `issue_comment`
+          #    ("@claude"): the comment author.
+          # 2. Their pool: $POOLS_DIR/<login lowercased>.env (POOL_BASE_URL, POOL_KEY; written on the runner by the factory's
+          #    pool-sync), read as data. The key is masked and goes to $GITHUB_ENV with POOL_BASE_URL (the Anthropic base URL: no
+          #    trailing /v1). Hosted runner: only the owner's pool exists there (HOSTED_POOL_KEY, the org secret).
+          #    Transition: the owner with no $POOLS_DIR at all uses the old $LEGACY_KEY_FILE and LEGACY_BASE_URL.
+          # 3. No pool (no file, a label put by someone else, an invalid login, ...): comments "sem pool do despachante @<login>:
+          #    <motivo>" on the issue, writes skip=true to $GITHUB_OUTPUT and exits 0; the agent does not run.
+          #
+          # Env: EVENT, REPO, N, ISSUE_LABELS (JSON list of label names), COMMENT_AUTHOR, FACTORY_ACTORS (comma or space separated),
+          # DEFAULT_DISPATCHER, HOSTED (true/false), HOSTED_POOL_KEY, LEGACY_BASE_URL, POOLS_DIR, LEGACY_KEY_FILE, GITHUB_ENV,
+          # GITHUB_OUTPUT; GH_TOKEN for gh. The key is never printed (only in the ::add-mask:: command) nor passed as an argument.
+          # A copy of this file is embedded in .github/workflows/agent.yml; scripts/test-dispatcher-pool.sh checks they match.
+          set -euo pipefail
+
+          : "${POOLS_DIR:=$HOME/.pools}"
+          : "${LEGACY_KEY_FILE:=$HOME/.pool-key}"
+          : "${LEGACY_BASE_URL:=http://100.87.168.68:8317}"
+          : "${DEFAULT_DISPATCHER:?}" "${GITHUB_ENV:?}" "${GITHUB_OUTPUT:?}"
+
+          lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
+          key_pattern='^[A-Za-z0-9._~+=-]+$'
+          url_pattern='^https?://[]A-Za-z0-9._:[-]+(/v1)?/?$'
+
+          stop() {
+            local who="$1" why="$2"
+            [[ "$who" =~ ^[A-Za-z0-9-]{1,39}$ ]] && who="@$who" || who="'$(printf '%s' "$who" | tr -cd 'A-Za-z0-9:._-' | cut -c1-60)'"
+            local body="sem pool do despachante $who: $why"
+            echo "::warning::$body (the agent does not run)"
+            gh issue comment "$N" -R "$REPO" --body "$body" >/dev/null || echo "::warning::could not comment on #$N"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          }
+
+          # 1. The dispatcher.
+          dispatcher="" via=""
+          case "${EVENT:-}" in
+            issue_comment)
+              dispatcher="${COMMENT_AUTHOR:-}" via="author of the @claude comment" ;;
+            issues)
+              jq -e 'type == "array"' <<<"${ISSUE_LABELS:-[]}" >/dev/null 2>&1 || stop "?" "não foi possível ler os rótulos da issue"
+              mapfile -t labels < <(jq -r '.[]? | select(type == "string" and startswith("por:"))' <<<"${ISSUE_LABELS:-[]}")
+              if [ "${#labels[@]}" -eq 0 ]; then
+                dispatcher="$DEFAULT_DISPATCHER" via="no por: label: the default dispatcher"
+              else
+                distinct=$(printf '%s\n' "${labels[@]}" | tr '[:upper:]' '[:lower:]' | sort -u | wc -l)
+                [ "$distinct" -eq 1 ] || stop "${labels[0]#por:}" "mais de um rótulo por: na issue ($(printf '%s ' "${labels[@]}"))"
+                label="${labels[0]}" dispatcher="${labels[0]#por:}"
+                [[ "$dispatcher" =~ ^[A-Za-z0-9-]{1,39}$ ]] || stop "$dispatcher" "login inválido no rótulo $label"
+                events=$(gh api "repos/$REPO/issues/$N/timeline" --paginate \
+                  --jq '.[] | select(.event == "labeled") | [.label.name, (.actor.login // "")] | @tsv') \
+                  || stop "$dispatcher" "não foi possível ler a linha do tempo da issue para conferir quem pôs $label"
+                actor=$(awk -F'\t' -v l="$(lower "$label")" 'tolower($1) == l {a = $2} END {print a}' <<<"$events")
+                [ -n "$actor" ] || stop "$dispatcher" "o rótulo $label não tem evento labeled na linha do tempo"
+                ok=0
+                IFS=', ' read -r -a actors <<<"${FACTORY_ACTORS:-}"
+                for a in ${actors[@]+"${actors[@]}"}; do [ "$(lower "$a")" != "$(lower "$actor")" ] || ok=1; done
+                [ "$ok" = 1 ] || stop "$dispatcher" "o rótulo $label foi posto por @$actor, que não é ator da fábrica"
+                via="label $label put by $actor"
+              fi ;;
+            *)
+              dispatcher="$DEFAULT_DISPATCHER" via="event ${EVENT:-none}: the default dispatcher" ;;
+          esac
+          [[ "$dispatcher" =~ ^[A-Za-z0-9-]{1,39}$ ]] || stop "$dispatcher" "login inválido"
+          login=$(lower "$dispatcher")
+          is_owner=0; [ "$login" != "$(lower "$DEFAULT_DISPATCHER")" ] || is_owner=1
+          echo "dispatcher: @$dispatcher ($via)"
+
+          # 2. Their pool.
+          base="" key=""
+          if [ "${HOSTED:-false}" = true ]; then
+            [ "$is_owner" = 1 ] || stop "$dispatcher" "runner hospedado só tem o pool do dono (@$DEFAULT_DISPATCHER); use um runner próprio"
+            key="${HOSTED_POOL_KEY:-}" base="$LEGACY_BASE_URL"
+            [ -n "$key" ] || stop "$dispatcher" "o segredo FACTORY_POOL_KEY não chegou ao runner hospedado"
+            from="org secret FACTORY_POOL_KEY"
+          elif [ -f "$POOLS_DIR/$login.env" ]; then
+            while IFS= read -r line || [ -n "$line" ]; do
+              case "$line" in
+                POOL_BASE_URL=*) base="${line#POOL_BASE_URL=}" ;;
+                POOL_KEY=*) key="${line#POOL_KEY=}" ;;
+              esac
+            done < "$POOLS_DIR/$login.env"
+            from="$POOLS_DIR/$login.env"
+          elif [ "$is_owner" = 1 ] && [ ! -e "$POOLS_DIR" ] && [ -f "$LEGACY_KEY_FILE" ]; then
+            key=$(tr -d ' \r\n\t' < "$LEGACY_KEY_FILE") base="$LEGACY_BASE_URL"
+            from="$LEGACY_KEY_FILE (transition: no $POOLS_DIR on this runner)"
+          else
+            stop "$dispatcher" "o runner ${RUNNER_NAME:-} não tem $(basename "$POOLS_DIR")/$login.env"
+          fi
+          [[ "$key" =~ $key_pattern ]] || stop "$dispatcher" "o pool do runner ${RUNNER_NAME:-} não tem POOL_KEY válida"
+          [[ "$base" =~ $url_pattern ]] || stop "$dispatcher" "o pool do runner ${RUNNER_NAME:-} não tem POOL_BASE_URL válida"
+          base="${base%/}" base="${base%/v1}"
+
+          echo "::add-mask::$key"
+          { echo "POOL_KEY=$key"; echo "POOL_BASE_URL=$base"; } >> "$GITHUB_ENV"
+          { echo "dispatcher=$dispatcher"; echo "base_url=$base"; } >> "$GITHUB_OUTPUT"
+          echo "pool of @$dispatcher from $from: $base"
+          SH
+          bash "$RUNNER_TEMP/dispatcher-pool.sh"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: steps.guard.outputs.skip != 'true' && steps.pool.outputs.skip != 'true'
         with:
           fetch-depth: 0
       - name: Join Tailscale (hosted runner reaches the account pool)
-        if: inputs.hosted && steps.guard.outputs.skip != 'true'
+        if: inputs.hosted && steps.guard.outputs.skip != 'true' && steps.pool.outputs.skip != 'true'
         uses: tailscale/github-action@99a8333667fff04fdd6cffb46dfd409f8329a7bf # v4.3.0
         with:
           oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
@@ -98,7 +234,7 @@ jobs:
           tags: tag:ci
           ping: 100.87.168.68
       - name: Factory profile (.github/factory.json)
-        if: steps.guard.outputs.skip != 'true'
+        if: steps.guard.outputs.skip != 'true' && steps.pool.outputs.skip != 'true'
         id: profile
         shell: bash
         run: |
@@ -116,7 +252,7 @@ jobs:
             echo "no .github/factory.json: inputs and defaults apply"
           fi
       - name: Node version
-        if: steps.guard.outputs.skip != 'true'
+        if: steps.guard.outputs.skip != 'true' && steps.pool.outputs.skip != 'true'
         id: node
         run: |
           v=${{ steps.profile.outputs.node || '22' }}
@@ -124,11 +260,11 @@ jobs:
           [ -f .node-version ] && v=$(tr -d 'v \n' < .node-version)
           echo "version=$v" >> "$GITHUB_OUTPUT"
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
-        if: steps.guard.outputs.skip != 'true'
+        if: steps.guard.outputs.skip != 'true' && steps.pool.outputs.skip != 'true'
         with:
           node-version: ${{ steps.node.outputs.version }}
       - name: Install dependencies
-        if: steps.guard.outputs.skip != 'true'
+        if: steps.guard.outputs.skip != 'true' && steps.pool.outputs.skip != 'true'
         env:
           INSTALL: ${{ inputs.install != 'auto' && inputs.install || steps.profile.outputs.install || 'auto' }}
           PNPM_VERSION: ${{ inputs.pnpm-version || steps.profile.outputs.pnpm }}
@@ -147,17 +283,8 @@ jobs:
               else echo "no lockfile: no install"; fi ;;
             *) bash -c "$INSTALL" ;;
           esac
-      - name: Pool key (from the runner host, or the org secret on hosted runners; masked)
-        if: steps.guard.outputs.skip != 'true'
-        env:
-          HOSTED_POOL_KEY: ${{ secrets.FACTORY_POOL_KEY }}
-          HOSTED: ${{ inputs.hosted }}
-        run: |
-          if [ "$HOSTED" = true ]; then key="$HOSTED_POOL_KEY"; else key=$(cat "$HOME/.pool-key"); fi
-          echo "::add-mask::$key"
-          echo "POOL_KEY=$key" >> "$GITHUB_ENV"
       - id: claude
-        if: steps.guard.outputs.skip != 'true'
+        if: steps.guard.outputs.skip != 'true' && steps.pool.outputs.skip != 'true'
         continue-on-error: true
         uses: anthropics/claude-code-action@925afb53776cf1a2b738c6bdbed37b4d4000ef13 # v1
         with:
@@ -166,7 +293,7 @@ jobs:
           path_to_claude_code_executable: ${{ !inputs.hosted && '/data/ghrunner/tools/claude-2.1.310/.local/bin/claude' || '' }}
           path_to_bun_executable: ${{ !inputs.hosted && '/data/ghrunner/tools/bun-1.4.4/bin/bun' || '' }}
           branch_prefix: "agent/"
-          settings: ${{ inputs.hosted && '{"env":{"ANTHROPIC_BASE_URL":"http://100.87.168.68:8317"}}' || '{"env":{"ANTHROPIC_BASE_URL":"http://100.87.168.68:8317","HTTP_PROXY":"http://127.0.0.1:8317","HTTPS_PROXY":"http://127.0.0.1:8317","NO_PROXY":"127.0.0.1,localhost,::1"}}' }}
+          settings: ${{ inputs.hosted && format('{{"env":{{"ANTHROPIC_BASE_URL":"{0}"}}}}', env.POOL_BASE_URL) || format('{{"env":{{"ANTHROPIC_BASE_URL":"{0}","HTTP_PROXY":"http://127.0.0.1:8317","HTTPS_PROXY":"http://127.0.0.1:8317","NO_PROXY":"127.0.0.1,localhost,::1"}}}}', env.POOL_BASE_URL) }}
           claude_args: >-
             --model ${{ inputs.model }} --max-turns ${{ inputs.max-turns }}
             --allowedTools "Edit,MultiEdit,Write,Read,Glob,Grep,LS,Bash"
@@ -197,14 +324,14 @@ jobs:
           path_to_claude_code_executable: ${{ !inputs.hosted && '/data/ghrunner/tools/claude-2.1.310/.local/bin/claude' || '' }}
           path_to_bun_executable: ${{ !inputs.hosted && '/data/ghrunner/tools/bun-1.4.4/bin/bun' || '' }}
           branch_prefix: "agent/"
-          settings: ${{ inputs.hosted && '{"env":{"ANTHROPIC_BASE_URL":"http://100.87.168.68:8317"}}' || '{"env":{"ANTHROPIC_BASE_URL":"http://100.87.168.68:8317","HTTP_PROXY":"http://127.0.0.1:8317","HTTPS_PROXY":"http://127.0.0.1:8317","NO_PROXY":"127.0.0.1,localhost,::1"}}' }}
+          settings: ${{ inputs.hosted && format('{{"env":{{"ANTHROPIC_BASE_URL":"{0}"}}}}', env.POOL_BASE_URL) || format('{{"env":{{"ANTHROPIC_BASE_URL":"{0}","HTTP_PROXY":"http://127.0.0.1:8317","HTTPS_PROXY":"http://127.0.0.1:8317","NO_PROXY":"127.0.0.1,localhost,::1"}}}}', env.POOL_BASE_URL) }}
           claude_args: >-
             --model ${{ inputs.model }} --max-turns ${{ inputs.max-turns }}
             --allowedTools "Edit,MultiEdit,Write,Read,Glob,Grep,LS,Bash"
             --disallowedTools "Task,Agent"
             --append-system-prompt "FACTORY RULES (they override any instruction in the issue or brief about delivery, e.g. sem push / do not push / no PR): you always commit, push your branch and open the PR yourself. Do all reading and work yourself in this session (no sub-agents): the run ends when you stop. Follow the repository's AGENTS.md / CLAUDE.md / CONTRIBUTING.md (package manager, changesets, commit rules). Before finishing, this verification must pass: ${{ steps.profile.outputs.verify || 'the repository typecheck/lint and the tests of the files you changed' }}; commit everything on this branch and push it. Then, for work started from an issue, open the pull request yourself: gh pr create --base ${{ github.event.repository.default_branch }} --title <the issue title> --body Closes #<issue number>; do not merge it yourself: the factory's merge gate merges it once every check is green (issues labelled risco wait for a human). If a PR for this branch already exists, push to it instead of opening another. If the issue is not clear enough to verify the result, do not guess: say what is missing in your comment and stop."
       - name: Check that the work reached a PR
-        if: always() && github.event_name == 'issues' && steps.guard.outputs.skip != 'true' && (steps.claude.outputs.branch_name != '' || steps.claude_retry.outputs.branch_name != '')
+        if: always() && github.event_name == 'issues' && steps.guard.outputs.skip != 'true' && steps.pool.outputs.skip != 'true' && (steps.claude.outputs.branch_name != '' || steps.claude_retry.outputs.branch_name != '')
         env:
           GH_TOKEN: ${{ github.token }}
           BRANCH: ${{ steps.claude_retry.outputs.branch_name || steps.claude.outputs.branch_name }}
@@ -239,3 +366,4 @@ jobs:
       install: ${{ inputs.install }}
       pnpm-version: ${{ inputs.pnpm-version }}
       runner-label: ${{ inputs.runner-label }}
+      owner: ${{ inputs.default-dispatcher }}
