@@ -4,7 +4,8 @@
 # 1. Checks out the PR head merged with its base (what will land), installs, runs lint/typecheck/unit/db check/contract
 #    tests with the runner's local Postgres (TEST_DATABASE_URL, PG*); a failing command is re-run on the clean base
 #    (baseline), so a failure that already exists on the base does not block the PR.
-# 2. Claude Code (account pool) reviews the diff against the linked issue criteria and the proof, and decides.
+# 2. Claude Code reviews the diff against the linked issue criteria and the proof, and decides. It runs on the owner's
+#    account pool (input `owner`): the review is the factory's work, not the dispatcher's.
 # 3. APPROVE: comment "APROVADO pela revisão de risco (head <sha7>)" + label `risco:aprovado`; the Mac merge gate merges
 #    (owner token, so the merge triggers the base branch workflows; a GITHUB_TOKEN merge would not). REQUEST_CHANGES:
 #    comment "@claude <changes> (head <sha7>)"; a GITHUB_TOKEN comment triggers no workflow, so the gate relays a short
@@ -41,6 +42,10 @@ on:
       runner-label:
         type: string
         default: agent
+      owner:
+        description: The owner's login; the review is factory work and runs on their pool ($HOME/.pools/<login>.env).
+        type: string
+        default: EmersonBraun
 
 jobs:
   review:
@@ -241,12 +246,27 @@ jobs:
             [ -s "$RR/cmds.tsv" ] || echo "No proof command found (no factory.json verify and no lint/typecheck/test scripts)."
           } > "$RR/proof.md"
           wc -c "$RR"/*.md "$RR/diff.patch"
-      - name: Pool key (from the runner host; masked)
+      - name: Pool key (the owner's pool on the runner host; masked)
         if: steps.pr.outputs.skip != 'true'
+        shell: bash
+        env:
+          OWNER: ${{ inputs.owner }}
         run: |
-          key=$(cat "$HOME/.pool-key")
+          set -euo pipefail
+          # The factory's work runs on the owner's pool: $HOME/.pools/<owner>.env; runners with no .pools/ yet keep the old
+          # $HOME/.pool-key (transition). Never another person's pool.
+          f="$HOME/.pools/${OWNER,,}.env" base="" key=""
+          if [ -f "$f" ]; then
+            while IFS= read -r line || [ -n "$line" ]; do
+              case "$line" in POOL_BASE_URL=*) base="${line#POOL_BASE_URL=}" ;; POOL_KEY=*) key="${line#POOL_KEY=}" ;; esac
+            done < "$f"
+          elif [ ! -e "$HOME/.pools" ]; then
+            key=$(tr -d ' \r\n\t' < "$HOME/.pool-key") base=http://100.87.168.68:8317
+          fi
+          [[ "$key" =~ ^[A-Za-z0-9._~+=-]+$ && "$base" =~ ^https?://[]A-Za-z0-9._:[-]+(/v1)?/?$ ]] || { echo "::error::no pool of the owner @$OWNER on runner $RUNNER_NAME"; exit 1; }
+          base="${base%/}" base="${base%/v1}"
           echo "::add-mask::$key"
-          echo "POOL_KEY=$key" >> "$GITHUB_ENV"
+          { echo "POOL_KEY=$key"; echo "POOL_BASE_URL=$base"; } >> "$GITHUB_ENV"
       - name: Review (Claude Code, account pool)
         id: claude
         if: steps.pr.outputs.skip != 'true'
@@ -257,7 +277,7 @@ jobs:
           github_token: ${{ github.token }}
           path_to_claude_code_executable: /data/ghrunner/tools/claude-2.1.310/.local/bin/claude
           path_to_bun_executable: /data/ghrunner/tools/bun-1.4.4/bin/bun
-          settings: '{"env":{"ANTHROPIC_BASE_URL":"http://100.87.168.68:8317","HTTP_PROXY":"http://127.0.0.1:8317","HTTPS_PROXY":"http://127.0.0.1:8317","NO_PROXY":"127.0.0.1,localhost,::1"}}'
+          settings: ${{ format('{{"env":{{"ANTHROPIC_BASE_URL":"{0}","HTTP_PROXY":"http://127.0.0.1:8317","HTTPS_PROXY":"http://127.0.0.1:8317","NO_PROXY":"127.0.0.1,localhost,::1"}}}}', env.POOL_BASE_URL) }}
           claude_args: >-
             --model ${{ inputs.model }} --max-turns ${{ inputs.max-turns }}
             --allowedTools "Read,Glob,Grep,LS,Write,Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(git blame:*)"
