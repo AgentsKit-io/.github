@@ -1,0 +1,73 @@
+name: start-service
+description: >
+  Sobe um banco (ou outro serviço) com `docker run` num runner da fábrica, no lugar de `services:`, e remove no fim.
+  Use `mode: start` no começo e `mode: stop` num passo `if: always()`.
+inputs:
+  mode:
+    description: start ou stop
+    default: start
+  name:
+    description: Nome curto do serviço (postgres, mongo). Vira o container fabrica-<run>-<attempt>-<name>.
+    required: true
+  image:
+    description: Imagem (obrigatória em start), por exemplo postgres:16 ou mongo:7.
+    default: ''
+  port:
+    description: Porta do serviço dentro do container (5432, 27017).
+    default: ''
+  env:
+    description: Variáveis do container, uma por linha (KEY=valor).
+    default: ''
+  health-cmd:
+    description: Comando de saúde dentro do container, por exemplo `pg_isready -U postgres`.
+    default: ''
+  host-port:
+    description: Porta no host. Vazio escolhe uma livre (vários runners dividem a máquina).
+    default: ''
+  timeout:
+    description: Segundos de espera pela saúde.
+    default: '60'
+outputs:
+  host-port:
+    description: Porta em 127.0.0.1 onde o serviço responde.
+    value: ${{ steps.run.outputs.host-port }}
+runs:
+  using: composite
+  steps:
+    - id: run
+      shell: bash
+      env:
+        MODE: ${{ inputs.mode }}
+        SVC: ${{ inputs.name }}
+        IMAGE: ${{ inputs.image }}
+        PORT: ${{ inputs.port }}
+        ENVS: ${{ inputs.env }}
+        HEALTH: ${{ inputs.health-cmd }}
+        HOST_PORT: ${{ inputs.host-port }}
+        WAIT: ${{ inputs.timeout }}
+      run: |
+        set -euo pipefail
+        c="fabrica-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${SVC}"
+        if [ "$MODE" = stop ]; then
+          docker rm -f -v "$c" >/dev/null 2>&1 || true
+          exit 0
+        fi
+        : "${IMAGE:?image é obrigatória em start}" "${PORT:?port é obrigatória em start}"
+        docker rm -f -v "$c" >/dev/null 2>&1 || true
+        args=(-d --name "$c" --label fabrica.run="$GITHUB_RUN_ID" -p "127.0.0.1:${HOST_PORT}:${PORT}")
+        while IFS= read -r line; do [ -n "$line" ] && args+=(-e "$line"); done <<< "$ENVS"
+        if [ -n "$HEALTH" ]; then
+          args+=(--health-cmd "$HEALTH" --health-interval 2s --health-timeout 3s --health-retries 30)
+        fi
+        docker run "${args[@]}" "$IMAGE" >/dev/null
+        if [ -n "$HEALTH" ]; then
+          end=$((SECONDS + WAIT))
+          until [ "$(docker inspect -f '{{.State.Health.Status}}' "$c")" = healthy ]; do
+            if [ "$SECONDS" -ge "$end" ]; then
+              echo "::error::$SVC não ficou saudável em ${WAIT}s"; docker logs "$c" | tail -n 30; docker rm -f -v "$c" >/dev/null; exit 1
+            fi
+            sleep 2
+          done
+        fi
+        hp=$(docker port "$c" "${PORT}/tcp" | head -1 | sed 's/.*://')
+        echo "host-port=$hp" >> "$GITHUB_OUTPUT"
