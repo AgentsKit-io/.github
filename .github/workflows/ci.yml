@@ -95,41 +95,6 @@ permissions: {}
 env:
   CI: 'true'
   FORCE_COLOR: '1'
-  # One dependency-install script for every job (run with: bash -euo pipefail -c "$JS_INSTALL").
-  # It writes `used=<bun|native>` to $GITHUB_OUTPUT when the step has an id.
-  JS_INSTALL: |
-    pm_spec=$(node -p "require('./package.json').packageManager || ''" 2>/dev/null || true)
-    pm_spec=${pm_spec%%+*}
-    native=npm
-    if [[ -f pnpm-lock.yaml || "$pm_spec" == pnpm@* ]]; then native=pnpm; fi
-    if [[ "$native" == pnpm ]]; then
-      npm install -g --no-fund --no-audit "${pm_spec:-pnpm@latest}" > /dev/null
-    fi
-    native_install() {
-      if [[ "$native" == pnpm ]]; then pnpm install --frozen-lockfile; else npm ci --no-fund --no-audit; fi
-    }
-    use=bun
-    [[ "$INSTALLER" == auto || "$INSTALLER" == bun ]] || use=native
-    if [[ "$use" == bun ]]; then
-      npm install -g --no-fund --no-audit "bun@${BUN_VERSION}" > /dev/null
-      bun_args=(install)
-      if [[ -f bun.lock || -f bun.lockb ]]; then bun_args+=(--frozen-lockfile); else bun_args+=(--no-save); fi
-      if bun "${bun_args[@]}"; then
-        echo "installed with bun ${BUN_VERSION}"
-      elif [[ "$INSTALLER" == auto ]]; then
-        echo "::warning::bun install failed; installing with $native"
-        rm -rf node_modules
-        use=native
-        native_install
-      else
-        exit 1
-      fi
-    else
-      use=native
-      native_install
-      echo "installed with $native"
-    fi
-    if [[ -n "${GITHUB_OUTPUT:-}" ]]; then printf 'used=%s\n' "$use" >> "$GITHUB_OUTPUT"; fi
   DEPS_CACHE_PATHS: |
     ~/.bun/install/cache
     ~/.npm
@@ -256,7 +221,41 @@ jobs:
         env:
           INSTALLER: ${{ inputs.installer }}
           BUN_VERSION: ${{ inputs.bun-version }}
-        run: bash -euo pipefail -c "$JS_INSTALL"
+        # The same install script runs in every job (YAML anchor). It writes used=<bun|native> to $GITHUB_OUTPUT.
+        run: &install-script |
+          set -euo pipefail
+          pm_spec=$(node -p "require('./package.json').packageManager || ''" 2>/dev/null || true)
+          pm_spec=${pm_spec%%+*}
+          native=npm
+          if [[ -f pnpm-lock.yaml || "$pm_spec" == pnpm@* ]]; then native=pnpm; fi
+          if [[ "$native" == pnpm ]]; then
+            npm install -g --no-fund --no-audit "${pm_spec:-pnpm@latest}" > /dev/null
+          fi
+          native_install() {
+            if [[ "$native" == pnpm ]]; then pnpm install --frozen-lockfile; else npm ci --no-fund --no-audit; fi
+          }
+          use=bun
+          [[ "$INSTALLER" == auto || "$INSTALLER" == bun ]] || use=native
+          if [[ "$use" == bun ]]; then
+            npm install -g --no-fund --no-audit "bun@${BUN_VERSION}" > /dev/null
+            bun_args=(install)
+            if [[ -f bun.lock || -f bun.lockb ]]; then bun_args+=(--frozen-lockfile); else bun_args+=(--no-save); fi
+            if bun "${bun_args[@]}"; then
+              echo "installed with bun ${BUN_VERSION}"
+            elif [[ "$INSTALLER" == auto ]]; then
+              echo "::warning::bun install failed; installing with $native"
+              rm -rf node_modules
+              use=native
+              native_install
+            else
+              exit 1
+            fi
+          else
+            use=native
+            native_install
+            echo "installed with $native"
+          fi
+          if [[ -n "${GITHUB_OUTPUT:-}" ]]; then printf 'used=%s\n' "$use" >> "$GITHUB_OUTPUT"; fi
       - name: Save dependency cache
         if: steps.check.outputs.cache-hit != 'true'
         uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
@@ -342,7 +341,7 @@ jobs:
         env:
           INSTALLER: ${{ inputs.installer }}
           BUN_VERSION: ${{ inputs.bun-version }}
-        run: bash -euo pipefail -c "$JS_INSTALL"
+        run: *install-script
       - name: Typecheck
         if: inputs.typecheck-command != '' && (env.MODE == 'pr' || env.MODE == 'full')
         shell: bash
@@ -386,7 +385,7 @@ jobs:
         env:
           INSTALLER: ${{ inputs.installer }}
           BUN_VERSION: ${{ inputs.bun-version }}
-        run: bash -euo pipefail -c "$JS_INSTALL"
+        run: *install-script
       - name: Test
         shell: bash
         env:
@@ -435,7 +434,7 @@ jobs:
         env:
           INSTALLER: ${{ inputs.installer }}
           BUN_VERSION: ${{ inputs.bun-version }}
-        run: bash -euo pipefail -c "$JS_INSTALL"
+        run: *install-script
       - name: Build
         shell: bash
         env:

@@ -95,7 +95,6 @@ jobs:
       contents: read
       actions: write # lets the pipeline cancel the run when a stage fails
     with:
-      runs-on: ${{ vars.RUNS_ON || '"ubuntu-24.04"' }}
       typecheck-command: pnpm typecheck
       affected-test-command: pnpm vitest run --changed "$BASE_REF"
       test-command: pnpm test
@@ -105,8 +104,10 @@ jobs:
         docs/*
 ```
 
-`runs-on` takes JSON, so a repository variable such as `RUNS_ON` can hold a
-label (`"ubuntu-24.04"`) or a list (`["self-hosted","linux"]`).
+Every job runs on `ubuntu-24.04` (GitHub-hosted) unless the caller passes
+`runs-on`, which takes JSON: a label (`'"ubuntu-24.04"'`) or a list. Public
+repositories should stay on GitHub-hosted runners: they accept pull requests
+from forks.
 
 A product job that should only run on ready pull requests and full runs can
 read the pipeline's mode:
