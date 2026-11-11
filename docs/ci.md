@@ -19,7 +19,19 @@ product-specific checks, and calls this workflow for the common stages.
 The stages are a chain: a red stage skips the stages after it, and a
 `cancel on failure` job cancels the rest of the caller's run (its own product
 jobs included). Every job has a timeout (`job-timeout-minutes`, default 20).
-The `result` job fails when any stage failed or was cancelled.
+The calling job's result (`needs.<job>.result`) is the pipeline's result, so a
+small gate job can keep an existing required check name:
+
+```yaml
+  verify:
+    needs: pipeline
+    if: always()
+    runs-on: ubuntu-24.04
+    steps:
+      - run: test "$RESULT" = success
+        env:
+          RESULT: ${{ needs.pipeline.result }}
+```
 
 ## Tools
 

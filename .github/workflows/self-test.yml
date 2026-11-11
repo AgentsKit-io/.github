@@ -32,7 +32,7 @@ jobs:
         run: bash scripts/test-dispatcher-pool.sh
 
   ci-pipeline:
-    # This repository has no package manifest: exercise plan, lint and the result gate on pull requests.
+    # This repository has no package manifest: exercise plan and lint on pull requests.
     if: github.event_name == 'pull_request'
     uses: ./.github/workflows/ci.yml
     permissions:

@@ -4,6 +4,7 @@ name: CI pipeline
 #
 # Pull requests run as a fail-fast chain: plan -> lint (+ typecheck) -> tests -> build.
 # A red stage skips the stages after it, and a failure cancels the rest of the caller's run.
+# The caller's job result (needs.<job>.result) is the pipeline's result: gate required checks on it.
 # Draft pull requests (and changes that only touch `light-paths`) run plan and lint only.
 # Pushes to the default branch only refresh the dependency cache.
 # Scheduled runs run everything, but only when the branch got a commit inside `nightly-window-hours`.
@@ -460,39 +461,3 @@ jobs:
           echo "A pipeline stage failed: cancelling the other jobs of this run."
           gh api -X POST "repos/${REPO}/actions/runs/${RUN_ID}/cancel" > /dev/null \
             || echo "::warning::Could not cancel the run (the caller must grant actions: write)."
-
-  result:
-    name: result
-    needs: [plan, seed-cache, lint, test, build]
-    if: always()
-    runs-on: ${{ fromJSON(inputs.runs-on) }}
-    timeout-minutes: 3
-    permissions: {}
-    steps:
-      - name: Summarize
-        shell: bash
-        env:
-          MODE: ${{ needs.plan.outputs.mode }}
-          PLAN: ${{ needs.plan.result }}
-          SEED: ${{ needs.seed-cache.result }}
-          LINT: ${{ needs.lint.result }}
-          TEST: ${{ needs.test.result }}
-          BUILD: ${{ needs.build.result }}
-        run: |
-          set -euo pipefail
-          printf '| stage | result |\n| --- | --- |\n' >> "$GITHUB_STEP_SUMMARY"
-          bad=''
-          for pair in "plan=$PLAN" "seed-cache=$SEED" "lint=$LINT" "test=$TEST" "build=$BUILD"; do
-            name=${pair%%=*}
-            value=${pair#*=}
-            printf '| %s | %s |\n' "$name" "$value" >> "$GITHUB_STEP_SUMMARY"
-            case "$value" in
-              success|skipped) ;;
-              *) bad+="${bad:+, }$name ($value)" ;;
-            esac
-          done
-          echo "mode=${MODE:-unknown}"
-          if [[ -n "$bad" ]]; then
-            echo "::error::Pipeline failed: $bad"
-            exit 1
-          fi
