@@ -140,6 +140,14 @@ actionlint and should be exercised by a caller repository with the graph
 enabled. Scorecard runs on PRs and on pushes to the default branch because the
 upstream action only accepts the default branch for push events.
 
+## Reusable CI pipeline
+
+[`ci.yml`](docs/ci.md) runs the common stages of a JavaScript or TypeScript
+repository as a fail-fast chain: plan, lint (oxlint, Biome format) and
+typecheck, tests, build. Draft pull requests run plan and lint only, pushes to
+the default branch only refresh the dependency cache, and scheduled runs skip
+when nothing changed. See [docs/ci.md](docs/ci.md) for the inputs and a caller.
+
 ## Runner selection
 
 Private repositories can use [pick-runner](docs/pick-runner.md) to select

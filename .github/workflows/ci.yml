@@ -1,0 +1,462 @@
+name: CI pipeline
+
+# Reusable JavaScript/TypeScript CI pipeline. See docs/ci.md for the inputs and a caller example.
+#
+# Pull requests run as a fail-fast chain: plan -> lint (+ typecheck) -> tests -> build.
+# A red stage skips the stages after it, and a failure cancels the rest of the caller's run.
+# The caller's job result (needs.<job>.result) is the pipeline's result: gate required checks on it.
+# Draft pull requests (and changes that only touch `light-paths`) run plan and lint only.
+# Pushes to the default branch only refresh the dependency cache.
+# Scheduled runs run everything, but only when the branch got a commit inside `nightly-window-hours`.
+
+on:
+  workflow_call:
+    inputs:
+      runs-on:
+        description: JSON runs-on value for every job, for example '"ubuntu-24.04"' or a repository variable.
+        type: string
+        default: '"ubuntu-24.04"'
+      node-version:
+        description: Node.js version.
+        type: string
+        default: '22'
+      installer:
+        description: >-
+          How dependencies are installed. `auto` tries Bun and falls back to the lockfile's own
+          package manager (pnpm or npm) if Bun fails; `bun` forces Bun; `native` uses the lockfile's
+          package manager only.
+        type: string
+        default: auto
+      bun-version:
+        description: Bun version used by the `auto` and `bun` installers.
+        type: string
+        default: 1.4.4
+      oxlint-version:
+        description: oxlint version used by the lint stage. Empty skips oxlint.
+        type: string
+        default: 1.90.0
+      oxlint-args:
+        description: Extra arguments for oxlint (for example `--deny-warnings` or `-c .oxlintrc.json`).
+        type: string
+        default: ''
+      biome-version:
+        description: Biome version used for the format check.
+        type: string
+        default: 2.6.4
+      format-scope:
+        description: >-
+          Which files the Biome format check fails on. `added` (files the pull request adds; files it
+          modifies only get a warning), `changed` (every file the pull request adds or modifies), `all`,
+          or `none`. The check needs a biome.json (or biome.jsonc) at the repository root.
+        type: string
+        default: added
+      typecheck-command:
+        description: Typecheck command, run in the lint stage of ready pull requests and full runs. Empty skips it.
+        type: string
+        default: ''
+      test-command:
+        description: Full test command (scheduled and manual runs, and pull requests without `affected-test-command`).
+        type: string
+        default: ''
+      affected-test-command:
+        description: >-
+          Test command for pull requests. BASE_REF holds the base commit SHA, so a command can test
+          only what changed (for example `vitest run --changed "$BASE_REF"`). Empty uses `test-command`.
+        type: string
+        default: ''
+      build-command:
+        description: Build command. Empty skips the build stage.
+        type: string
+        default: ''
+      light-paths:
+        description: >-
+          Newline-separated shell patterns (`*` also matches `/`, so `docs/*` covers all of docs/).
+          A pull request whose changed files all match runs plan and lint only.
+        type: string
+        default: ''
+      nightly-window-hours:
+        description: A scheduled run is skipped when the newest commit is older than this.
+        type: number
+        default: 25
+      job-timeout-minutes:
+        description: Timeout of the install, lint, test and build jobs.
+        type: number
+        default: 20
+    outputs:
+      mode:
+        description: 'draft, light, pr, full, seed or skip'
+        value: ${{ jobs.plan.outputs.mode }}
+      base-ref:
+        description: Base commit SHA of a pull request run (empty otherwise).
+        value: ${{ jobs.plan.outputs.base-ref }}
+
+permissions: {}
+
+env:
+  CI: 'true'
+  FORCE_COLOR: '1'
+  DEPS_CACHE_PATHS: |
+    ~/.bun/install/cache
+    ~/.npm
+    ~/.local/share/pnpm/store
+
+jobs:
+  plan:
+    name: plan
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      mode: ${{ steps.mode.outputs.mode }}
+      base-ref: ${{ steps.mode.outputs.base-ref }}
+      cache-key: ${{ steps.cache.outputs.key }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+          filter: blob:none
+      - name: Decide what runs
+        id: mode
+        shell: bash
+        env:
+          EVENT: ${{ github.event_name }}
+          DRAFT: ${{ github.event.pull_request.draft }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          MERGE_GROUP_BASE: ${{ github.event.merge_group.base_sha }}
+          LIGHT_PATHS: ${{ inputs.light-paths }}
+          WINDOW_HOURS: ${{ inputs.nightly-window-hours }}
+        run: |
+          set -euo pipefail
+          base=''
+          case "$EVENT" in
+            pull_request|pull_request_target) base=$PR_BASE ;;
+            merge_group) base=$MERGE_GROUP_BASE ;;
+          esac
+          mode=full
+          why='full run'
+          if [[ "$EVENT" == push ]]; then
+            mode=seed
+            why='push to the branch: refresh the dependency cache only'
+          elif [[ "$EVENT" == schedule ]]; then
+            newest=$(git log -1 --format=%ct HEAD)
+            age=$(( $(date -u +%s) - newest ))
+            if (( age > WINDOW_HOURS * 3600 )); then
+              mode=skip
+              why="scheduled run: no commit in the last ${WINDOW_HOURS} h"
+            else
+              why='scheduled run: the branch changed'
+            fi
+          elif [[ -n "$base" ]]; then
+            mode='pr'
+            why='pull request'
+            if [[ "$DRAFT" == true ]]; then
+              mode=draft
+              why='draft pull request: plan and lint only'
+            elif [[ -n "${LIGHT_PATHS//[[:space:]]/}" ]]; then
+              # Shell patterns (bash [[ == ]]): `*` also matches `/`, so `docs/*` covers every file under docs/.
+              light=true
+              any=false
+              while IFS= read -r file; do
+                [[ -n "$file" ]] || continue
+                any=true
+                hit=false
+                while IFS= read -r pattern; do
+                  pattern=${pattern#"${pattern%%[![:space:]]*}"}
+                  pattern=${pattern%"${pattern##*[![:space:]]}"}
+                  [[ -n "$pattern" ]] || continue
+                  # shellcheck disable=SC2053 # the right side is a pattern on purpose
+                  if [[ "$file" == $pattern ]]; then hit=true; break; fi
+                done <<<"$LIGHT_PATHS"
+                if [[ "$hit" == false ]]; then light=false; break; fi
+              done < <(git diff --name-only "$base" HEAD)
+              if [[ "$any" == true && "$light" == true ]]; then
+                mode=light
+                why='every change matches light-paths: plan and lint only'
+              fi
+            fi
+          fi
+          printf 'mode=%s\nbase-ref=%s\n' "$mode" "$base" >> "$GITHUB_OUTPUT"
+          # shellcheck disable=SC2016 # backticks are Markdown here
+          printf '### CI plan\n\n`%s`: %s\n' "$mode" "$why" >> "$GITHUB_STEP_SUMMARY"
+          echo "mode=$mode ($why)"
+      - name: Cache key
+        id: cache
+        shell: bash
+        env:
+          INSTALLER: ${{ inputs.installer }}
+          LOCK_HASH: ${{ hashFiles('**/pnpm-lock.yaml', '**/package-lock.json', '**/bun.lock', '**/yarn.lock', '!**/node_modules/**') }}
+        run: printf 'key=deps-%s-%s-%s\n' "$RUNNER_OS" "$INSTALLER" "$LOCK_HASH" >> "$GITHUB_OUTPUT"
+
+  seed-cache:
+    name: seed cache
+    needs: plan
+    if: needs.plan.outputs.mode == 'seed'
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
+    timeout-minutes: ${{ inputs.job-timeout-minutes }}
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ inputs.node-version }}
+      - name: Check the cache
+        id: check
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ${{ env.DEPS_CACHE_PATHS }}
+          key: ${{ needs.plan.outputs.cache-key }}-${{ (inputs.installer == 'auto' || inputs.installer == 'bun') && 'bun' || 'native' }}
+          lookup-only: true
+      - name: Install dependencies
+        id: install
+        if: steps.check.outputs.cache-hit != 'true'
+        shell: bash
+        env:
+          INSTALLER: ${{ inputs.installer }}
+          BUN_VERSION: ${{ inputs.bun-version }}
+        # The same install script runs in every job (YAML anchor). It writes used=<bun|native> to $GITHUB_OUTPUT.
+        run: &install-script |
+          set -euo pipefail
+          pm_spec=$(node -p "require('./package.json').packageManager || ''" 2>/dev/null || true)
+          pm_spec=${pm_spec%%+*}
+          native=npm
+          if [[ -f pnpm-lock.yaml || "$pm_spec" == pnpm@* ]]; then native=pnpm; fi
+          if [[ "$native" == pnpm ]]; then
+            npm install -g --no-fund --no-audit "${pm_spec:-pnpm@latest}" > /dev/null
+          fi
+          native_install() {
+            if [[ "$native" == pnpm ]]; then pnpm install --frozen-lockfile; else npm ci --no-fund --no-audit; fi
+          }
+          use=bun
+          [[ "$INSTALLER" == auto || "$INSTALLER" == bun ]] || use=native
+          if [[ "$use" == bun ]]; then
+            npm install -g --no-fund --no-audit "bun@${BUN_VERSION}" > /dev/null
+            bun_args=(install)
+            if [[ -f bun.lock || -f bun.lockb ]]; then bun_args+=(--frozen-lockfile); else bun_args+=(--no-save); fi
+            if bun "${bun_args[@]}"; then
+              echo "installed with bun ${BUN_VERSION}"
+            elif [[ "$INSTALLER" == auto ]]; then
+              echo "::warning::bun install failed; installing with $native"
+              rm -rf node_modules
+              use=native
+              native_install
+            else
+              exit 1
+            fi
+          else
+            use=native
+            native_install
+            echo "installed with $native"
+          fi
+          if [[ -n "${GITHUB_OUTPUT:-}" ]]; then printf 'used=%s\n' "$use" >> "$GITHUB_OUTPUT"; fi
+      - name: Save dependency cache
+        if: steps.check.outputs.cache-hit != 'true'
+        uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ${{ env.DEPS_CACHE_PATHS }}
+          key: ${{ needs.plan.outputs.cache-key }}-${{ steps.install.outputs.used }}
+
+  lint:
+    name: lint
+    needs: plan
+    if: contains(fromJSON('["draft","light","pr","full"]'), needs.plan.outputs.mode)
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
+    timeout-minutes: ${{ inputs.job-timeout-minutes }}
+    permissions:
+      contents: read
+    env:
+      BASE_REF: ${{ needs.plan.outputs.base-ref }}
+      MODE: ${{ needs.plan.outputs.mode }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+          filter: blob:none
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ inputs.node-version }}
+      - name: oxlint
+        if: inputs.oxlint-version != ''
+        shell: bash
+        env:
+          OXLINT_VERSION: ${{ inputs.oxlint-version }}
+          OXLINT_ARGS: ${{ inputs.oxlint-args }}
+        run: |
+          set -euo pipefail
+          read -r -a extra <<<"$OXLINT_ARGS"
+          npx --yes "oxlint@${OXLINT_VERSION}" --format=github "${extra[@]}"
+      - name: Biome format
+        if: inputs.format-scope != 'none'
+        shell: bash
+        env:
+          BIOME_VERSION: ${{ inputs.biome-version }}
+          SCOPE: ${{ inputs.format-scope }}
+        run: |
+          set -euo pipefail
+          if [[ ! -f biome.json && ! -f biome.jsonc ]]; then
+            echo "::notice::No biome.json at the repository root: format check skipped"
+            exit 0
+          fi
+          biome=(npx --yes "@biomejs/biome@${BIOME_VERSION}" format --no-errors-on-unmatched --files-ignore-unknown=true)
+          if [[ "$SCOPE" == all || -z "$BASE_REF" ]]; then
+            [[ "$SCOPE" == all ]] || { echo "Not a pull request: format check skipped"; exit 0; }
+            "${biome[@]}" .
+            exit 0
+          fi
+          mapfile -t added < <(git diff --name-only --diff-filter=A "$BASE_REF" HEAD)
+          mapfile -t modified < <(git diff --name-only --diff-filter=M "$BASE_REF" HEAD)
+          strict=("${added[@]}")
+          loose=()
+          if [[ "$SCOPE" == changed ]]; then strict+=("${modified[@]}"); else loose=("${modified[@]}"); fi
+          if (( ${#loose[@]} > 0 )) && ! "${biome[@]}" "${loose[@]}" > /dev/null 2>&1; then
+            echo "::warning::Some modified files are not Biome-formatted. Run: npx @biomejs/biome@${BIOME_VERSION} format --write <files>"
+          fi
+          if (( ${#strict[@]} > 0 )); then
+            "${biome[@]}" "${strict[@]}"
+          else
+            echo "No files in the strict format scope"
+          fi
+      - name: Restore dependency cache
+        if: inputs.typecheck-command != '' && (env.MODE == 'pr' || env.MODE == 'full')
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ${{ env.DEPS_CACHE_PATHS }}
+          key: ${{ needs.plan.outputs.cache-key }}-
+          restore-keys: |
+            ${{ needs.plan.outputs.cache-key }}-
+            deps-${{ runner.os }}-${{ inputs.installer }}-
+      - name: Install dependencies
+        if: inputs.typecheck-command != '' && (env.MODE == 'pr' || env.MODE == 'full')
+        shell: bash
+        env:
+          INSTALLER: ${{ inputs.installer }}
+          BUN_VERSION: ${{ inputs.bun-version }}
+        run: *install-script
+      - name: Typecheck
+        if: inputs.typecheck-command != '' && (env.MODE == 'pr' || env.MODE == 'full')
+        shell: bash
+        env:
+          COMMAND: ${{ inputs.typecheck-command }}
+        run: bash -euo pipefail -c "$COMMAND"
+
+  test:
+    name: test
+    needs: [plan, lint]
+    if: contains(fromJSON('["pr","full"]'), needs.plan.outputs.mode) && (inputs.test-command != '' || inputs.affected-test-command != '')
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
+    timeout-minutes: ${{ inputs.job-timeout-minutes }}
+    permissions:
+      contents: read
+    env:
+      BASE_REF: ${{ needs.plan.outputs.base-ref }}
+      MODE: ${{ needs.plan.outputs.mode }}
+      CI_TEST_PROFILE: ${{ needs.plan.outputs.mode == 'pr' && 'pr' || 'full' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: ${{ needs.plan.outputs.mode == 'pr' && '0' || '1' }}
+          filter: ${{ needs.plan.outputs.mode == 'pr' && 'blob:none' || '' }}
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ inputs.node-version }}
+      - name: Restore dependency cache
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ${{ env.DEPS_CACHE_PATHS }}
+          key: ${{ needs.plan.outputs.cache-key }}-
+          restore-keys: |
+            ${{ needs.plan.outputs.cache-key }}-
+            deps-${{ runner.os }}-${{ inputs.installer }}-
+      - name: Install dependencies
+        shell: bash
+        env:
+          INSTALLER: ${{ inputs.installer }}
+          BUN_VERSION: ${{ inputs.bun-version }}
+        run: *install-script
+      - name: Test
+        shell: bash
+        env:
+          FULL: ${{ inputs.test-command }}
+          AFFECTED: ${{ inputs.affected-test-command }}
+        run: |
+          set -euo pipefail
+          command=$FULL
+          if [[ "$MODE" == pr && -n "$AFFECTED" ]]; then command=$AFFECTED; fi
+          [[ -n "$command" ]] || command=$AFFECTED
+          echo "CI_TEST_PROFILE=$CI_TEST_PROFILE BASE_REF=${BASE_REF:-none}"
+          bash -euo pipefail -c "$command"
+
+  build:
+    name: build
+    needs: [plan, lint, test]
+    if: >-
+      !cancelled() && contains(fromJSON('["pr","full"]'), needs.plan.outputs.mode) && inputs.build-command != ''
+      && needs.lint.result == 'success' && (needs.test.result == 'success' || needs.test.result == 'skipped')
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
+    timeout-minutes: ${{ inputs.job-timeout-minutes }}
+    permissions:
+      contents: read
+    env:
+      BASE_REF: ${{ needs.plan.outputs.base-ref }}
+      MODE: ${{ needs.plan.outputs.mode }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ inputs.node-version }}
+      - name: Restore dependency cache
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ${{ env.DEPS_CACHE_PATHS }}
+          key: ${{ needs.plan.outputs.cache-key }}-
+          restore-keys: |
+            ${{ needs.plan.outputs.cache-key }}-
+            deps-${{ runner.os }}-${{ inputs.installer }}-
+      - name: Install dependencies
+        shell: bash
+        env:
+          INSTALLER: ${{ inputs.installer }}
+          BUN_VERSION: ${{ inputs.bun-version }}
+        run: *install-script
+      - name: Build
+        shell: bash
+        env:
+          COMMAND: ${{ inputs.build-command }}
+        run: bash -euo pipefail -c "$COMMAND"
+
+  cancel-on-failure:
+    name: cancel on failure
+    needs: [plan, seed-cache, lint, test, build]
+    if: failure() && github.event_name != 'schedule'
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
+    timeout-minutes: 3
+    permissions:
+      actions: write
+    steps:
+      - name: Cancel the rest of the run
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          echo "A pipeline stage failed: cancelling the other jobs of this run."
+          gh api -X POST "repos/${REPO}/actions/runs/${RUN_ID}/cancel" > /dev/null \
+            || echo "::warning::Could not cancel the run (the caller must grant actions: write)."

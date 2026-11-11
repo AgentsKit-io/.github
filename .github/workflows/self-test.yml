@@ -31,6 +31,16 @@ jobs:
       - name: Test the dispatcher's pool step (fake gh, throwaway HOME)
         run: bash scripts/test-dispatcher-pool.sh
 
+  ci-pipeline:
+    # This repository has no package manifest: exercise plan and lint on pull requests.
+    if: github.event_name == 'pull_request'
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      actions: write
+      contents: read
+    with:
+      format-scope: none
+
   codeql:
     uses: ./.github/workflows/codeql.yml
     permissions:
