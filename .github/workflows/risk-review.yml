@@ -271,7 +271,7 @@ jobs:
         id: claude
         if: steps.pr.outputs.skip != 'true'
         continue-on-error: true
-        uses: anthropics/claude-code-action@61a9c274fa7110a66dfafc1bbbced03833eb25fe # v1
+        uses: anthropics/claude-code-action@f431adaf77e0fecf918431e75a2b5b45b85af002 # v1
         with:
           anthropic_api_key: ${{ env.POOL_KEY }}
           github_token: ${{ github.token }}
