@@ -209,7 +209,7 @@ jobs:
           node-version: ${{ inputs.node-version }}
       - name: Check the cache
         id: check
-        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ env.DEPS_CACHE_PATHS }}
           key: ${{ needs.plan.outputs.cache-key }}-${{ (inputs.installer == 'auto' || inputs.installer == 'bun') && 'bun' || 'native' }}
@@ -258,7 +258,7 @@ jobs:
           if [[ -n "${GITHUB_OUTPUT:-}" ]]; then printf 'used=%s\n' "$use" >> "$GITHUB_OUTPUT"; fi
       - name: Save dependency cache
         if: steps.check.outputs.cache-hit != 'true'
-        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ env.DEPS_CACHE_PATHS }}
           key: ${{ needs.plan.outputs.cache-key }}-${{ steps.install.outputs.used }}
@@ -328,7 +328,7 @@ jobs:
           fi
       - name: Restore dependency cache
         if: inputs.typecheck-command != '' && (env.MODE == 'pr' || env.MODE == 'full')
-        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ env.DEPS_CACHE_PATHS }}
           key: ${{ needs.plan.outputs.cache-key }}-
@@ -373,7 +373,7 @@ jobs:
         with:
           node-version: ${{ inputs.node-version }}
       - name: Restore dependency cache
-        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ env.DEPS_CACHE_PATHS }}
           key: ${{ needs.plan.outputs.cache-key }}-
@@ -422,7 +422,7 @@ jobs:
         with:
           node-version: ${{ inputs.node-version }}
       - name: Restore dependency cache
-        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ env.DEPS_CACHE_PATHS }}
           key: ${{ needs.plan.outputs.cache-key }}-
